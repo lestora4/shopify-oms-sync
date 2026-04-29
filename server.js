@@ -643,7 +643,64 @@ app.post("/refresh-token", async (req, res) => {
     res.status(500).json({ success: false, error: err.message });
   }
 });
+// ================= HOMEPAGE =================
 
+app.get("/", (req, res) => {
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>Shopify-OMS B2B Sync</title>
+      <style>
+        body { font-family: Arial; padding: 20px; max-width: 800px; margin: 0 auto; }
+        .status { color: green; font-weight: bold; }
+        .card { border: 1px solid #ccc; padding: 15px; margin: 10px 0; border-radius: 5px; }
+        button { padding: 10px 20px; background: #007bff; color: white; border: none; border-radius: 5px; cursor: pointer; }
+        pre { background: #f4f4f4; padding: 10px; border-radius: 5px; overflow-x: auto; }
+      </style>
+    </head>
+    <body>
+      <h1>🔄 Shopify-OMS B2B Price Sync</h1>
+      <div class="card">
+        <h2>Status: <span class="status">✅ RUNNING</span></h2>
+        <p>Auto-sync: Every 30 minutes</p>
+        <p>B2B Catalogs: Silver, Gold, Platinum</p>
+      </div>
+      <div class="card">
+        <h2>⚡ Actions</h2>
+        <button onclick="manualSync()">Manual Sync Now</button>
+        <button onclick="refreshStatus()">Refresh Status</button>
+      </div>
+      <div class="card">
+        <h2>📋 Endpoints</h2>
+        <ul>
+          <li><a href="/health">Health Check</a></li>
+          <li><a href="/debug/status">Status</a></li>
+          <li><a href="/debug/missing">Missing SKUs</a></li>
+        </ul>
+      </div>
+      <div class="card">
+        <h2>📋 Sync Log</h2>
+        <pre id="log">Click sync to see results...</pre>
+      </div>
+      <script>
+        async function refreshStatus() {
+          const res = await fetch('/health');
+          const data = await res.json();
+          document.getElementById('log').innerText = JSON.stringify(data, null, 2);
+        }
+        async function manualSync() {
+          document.getElementById('log').innerText = '⏳ Syncing...';
+          const res = await fetch('/sync', {method: 'POST'});
+          const data = await res.json();
+          document.getElementById('log').innerText = JSON.stringify(data, null, 2);
+        }
+        refreshStatus();
+      </script>
+    </body>
+    </html>
+  `);
+});
 // ================= START SERVER =================
 
 const PORT = 3000;
