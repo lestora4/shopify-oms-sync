@@ -1120,46 +1120,33 @@ app.post("/sync", async (req, res) => {
     res.json({ success: true, message: "Sync started" });
 });
 // ================= FULL SYNC ENDPOINT =================
+// ================= FULL SYNC ENDPOINT =================
 app.post("/full-sync", async (req, res) => {
     if (isRunning) {
         return res.json({ success: false, error: "Sync already in progress" });
     }
     
-    // Clear the sync state to force full sync of all products
     addLog("📦 FULL SYNC MODE - Will sync all products regardless of previous sync", "warning");
     
-    // Temporarily clear synced SKUs to force full sync
-    const wasRunning = isRunning;
-    if (!wasRunning) {
-        // Store original state
-        const originalSyncedSkus = [...lastSyncState.syncedSkus];
-        
-        // Clear synced SKUs to force full sync
-        lastSyncState.syncedSkus = [];
-        addLog("📋 Cleared sync history - will sync ALL products", "info");
-        
-        // Run full sync
-        runSync().catch(console.error);
-        
-        // Restore after sync completes (will be updated by runSync anyway)
-        setTimeout(() => {
-            if (lastSyncState.syncedSkus.length === 0 && originalSyncedSkus.length > 0) {
-                lastSyncState.syncedSkus = originalSyncedSkus;
-            }
-        }, 1000);
-    } else {
-        runSync().catch(console.error);
-    }
+    // Force clear sync state to sync all products
+    const originalSyncedSkus = [...lastSyncState.syncedSkus];
+    lastSyncState.syncedSkus = [];
+    addLog("📋 Cleared sync history - will sync ALL products", "info");
+    
+    // Run full sync in background
+    runSync().catch(console.error);
     
     res.json({ success: true, message: "Full sync started" });
-});// ================= INCREMENTAL SYNC ENDPOINT =================
+});
+// ================= INCREMENTAL SYNC ENDPOINT =================
+// ================= INCREMENTAL SYNC ENDPOINT =================
 app.post("/incremental-sync", async (req, res) => {
     if (isRunning) {
         return res.json({ success: false, error: "Sync already in progress" });
     }
     
     addLog("⚡ INCREMENTAL SYNC MODE - Will only sync changed products", "info");
-    runSync().catch(console.error);
+    syncChangedProducts().catch(console.error);
     res.json({ success: true, message: "Incremental sync started" });
 });
 
@@ -1362,13 +1349,31 @@ app.get("/", (req, res) => {
                     }
                 }
                 
-                async function startSync() {
+            async function startSync() {
     addLog('⚡ INCREMENTAL_SYNC_TRIGGERED', 'info');
     const response = await fetch('/incremental-sync', { method: 'POST' });
     const data = await response.json();
-    if (data.success) addLog('INCREMENTAL_SYNC_STARTED', 'success');
-    else addLog('SYNC_FAILED: ' + data.error, 'error');
-}async function checkManualPrices() {
+    if (data.success) {
+        addLog('INCREMENTAL_SYNC_STARTED - Syncing changed products only', 'success');
+    } else {
+        addLog('SYNC_FAILED: ' + data.error, 'error');
+    }
+}
+
+async function startFullSync() {
+    addLog('🔄 FULL_SYNC_TRIGGERED - This will sync ALL products', 'warning');
+    addLog('⚠️ This may take 5-10 minutes for 2000+ products', 'warning');
+    const response = await fetch('/full-sync', { method: 'POST' });
+    const data = await response.json();
+    if (data.success) {
+        addLog('FULL_SYNC_STARTED - Syncing all products...', 'success');
+        // Force refresh stats
+        setTimeout(() => fetchStats(), 1000);
+    } else {
+        addLog('FULL_SYNC_FAILED: ' + data.error, 'error');
+    }
+}
+                async function checkManualPrices() {
     addLog('🔍 CHECKING FOR MANUAL PRICE CHANGES...', 'info');
     const response = await fetch('/check-manual-prices', { method: 'POST' });
     const data = await response.json();
