@@ -297,21 +297,55 @@ async function lookupSkuInOMS(sku) {
         const data = await response.json();
         if (!data.variants || data.variants.length === 0) return null;
         
-        const pieceVariant = data.variants.find(v => 
-            v.unit?.type?.toLowerCase() === "piece" || 
-            (!v.sku.includes("_box") && !v.sku.includes("_case"))
+        // Priority order: piece > each > box > case > any variant
+        let selectedVariant = null;
+        
+        // Try to find piece unit first
+        selectedVariant = data.variants.find(v => 
+            v.unit?.type?.toLowerCase() === "piece"
         );
         
-        if (!pieceVariant) return null;
+        // If no piece, try "each"
+        if (!selectedVariant) {
+            selectedVariant = data.variants.find(v => 
+                v.unit?.type?.toLowerCase() === "each"
+            );
+        }
+        
+        // If still none, take the first variant that's NOT box/case (or just first if all are box/case)
+        if (!selectedVariant) {
+            selectedVariant = data.variants.find(v => 
+                !v.sku.toLowerCase().includes("_box") && 
+                !v.sku.toLowerCase().includes("_case") &&
+                !v.unit?.type?.toLowerCase()?.includes("box") &&
+                !v.unit?.type?.toLowerCase()?.includes("case")
+            );
+        }
+        
+        // Last resort: take the first variant
+        if (!selectedVariant && data.variants.length > 0) {
+            selectedVariant = data.variants[0];
+            addLog(`   ⚠️ ${sku}: Using fallback unit type: ${selectedVariant.unit?.type || 'unknown'}`, "warning");
+        }
+        
+        if (!selectedVariant) return null;
+        
+        const silver = getPrice(selectedVariant.prices, "Silver");
+        const gold = getPrice(selectedVariant.prices, "Gold");
+        const platinum = getPrice(selectedVariant.prices, "Platinum");
+        
+        addLog(`   📦 ${sku}: Using unit type "${selectedVariant.unit?.type || 'unknown'}" - S:$${silver} G:$${gold} P:$${platinum}`, "info");
         
         return {
-            silver: getPrice(pieceVariant.prices, "Silver"),
-            gold: getPrice(pieceVariant.prices, "Gold"),
-            platinum: getPrice(pieceVariant.prices, "Platinum"),
-            originalSku: pieceVariant.sku
+            silver: silver,
+            gold: gold,
+            platinum: platinum,
+            originalSku: selectedVariant.sku,
+            unit: selectedVariant.unit?.type
         };
         
     } catch (err) {
+        addLog(`   ❌ OMS lookup error for ${sku}: ${err.message}`, "error");
         return null;
     }
 }
@@ -320,15 +354,32 @@ async function lookupSkuInOMS(sku) {
 
 async function getCurrentPriceListPrices(variantId) {
     try {
+        // Query all three price lists in a single GraphQL request
         const query = `
             query($variantId: ID!) {
-                priceList(id: "${SILVER_PRICE_LIST}") {
+                silver: priceList(id: "${SILVER_PRICE_LIST}") {
                     priceListPrices(first: 1, variantId: $variantId) {
                         edges {
                             node {
-                                price {
-                                    amount
-                                }
+                                price { amount }
+                            }
+                        }
+                    }
+                }
+                gold: priceList(id: "${GOLD_PRICE_LIST}") {
+                    priceListPrices(first: 1, variantId: $variantId) {
+                        edges {
+                            node {
+                                price { amount }
+                            }
+                        }
+                    }
+                }
+                platinum: priceList(id: "${PLATINUM_PRICE_LIST}") {
+                    priceListPrices(first: 1, variantId: $variantId) {
+                        edges {
+                            node {
+                                price { amount }
                             }
                         }
                     }
@@ -337,9 +388,18 @@ async function getCurrentPriceListPrices(variantId) {
         `;
         
         const data = await shopifyGraphQL(query, { variantId });
-        const silverPrice = data?.priceList?.priceListPrices?.edges?.[0]?.node?.price?.amount || 0;
-        return { silver: parseFloat(silverPrice), gold: 0, platinum: 0 };
+        
+        const silverPrice = data?.silver?.priceListPrices?.edges?.[0]?.node?.price?.amount || 0;
+        const goldPrice = data?.gold?.priceListPrices?.edges?.[0]?.node?.price?.amount || 0;
+        const platinumPrice = data?.platinum?.priceListPrices?.edges?.[0]?.node?.price?.amount || 0;
+        
+        return {
+            silver: parseFloat(silverPrice),
+            gold: parseFloat(goldPrice),
+            platinum: parseFloat(platinumPrice)
+        };
     } catch (err) {
+        addLog(`⚠️ Could not fetch prices for ${variantId}: ${err.message}`, "warning");
         return { silver: 0, gold: 0, platinum: 0 };
     }
 }
@@ -492,8 +552,7 @@ async function syncChangedProducts() {
                 continue;
             }
             
-            // Update price lists
-            const updatePriceList = async (listId, type, price) => {
+                        const updatePriceList = async (listId, price) => {
                 const mutation = `
                     mutation($id: ID!, $prices: [PriceListPriceInput!]!) {
                         priceListFixedPricesAdd(priceListId: $id, prices: $prices) {
@@ -514,14 +573,13 @@ async function syncChangedProducts() {
             };
             
             const results = await Promise.all([
-                updatePriceList(SILVER_PRICE_LIST, "Silver", omsPrices.silver),
-                updatePriceList(GOLD_PRICE_LIST, "Gold", omsPrices.gold),
-                updatePriceList(PLATINUM_PRICE_LIST, "Platinum", omsPrices.platinum)
+                updatePriceList(SILVER_PRICE_LIST, omsPrices.silver),
+                updatePriceList(GOLD_PRICE_LIST, omsPrices.gold),
+                updatePriceList(PLATINUM_PRICE_LIST, omsPrices.platinum)
             ]);
-            
             if (results.every(r => r === true)) {
                 addPriceChange(sku, variant.product?.title || sku, currentPrices, omsPrices);
-                addLog(`   ✅ Updated ${sku} - Silver:$${omsPrices.silver}`, "success");
+                addLog(`   ✅ Updated ${sku} - S:$${omsPrices.silver} G:$${omsPrices.gold} P:$${omsPrices.platinum}`, "success");
                 successCount++;
             } else {
                 addLog(`   ❌ Failed to update ${sku}`, "error");
@@ -629,18 +687,21 @@ async function runSync() {
         
         addLog(`\n💰 Step 3: Checking current Shopify prices for ${foundInOMS.length} products...`, "info");
         
-        const priceCheckResults = await processConcurrently(
-            foundInOMS,
-            CONCURRENT_REQUESTS,
-            async (item) => {
-                const currentPrices = await getCurrentPriceListPrices(item.id);
-                const needsUpdate = currentPrices.silver !== item.omsPrices.silver;
-                const isNew = newProducts.some(p => p.sku === item.sku);
-                
-                return { ...item, currentPrices, needsUpdate, isNew };
-            }
-        );
+       const priceCheckResults = await processConcurrently(
+    foundInOMS,
+    CONCURRENT_REQUESTS,
+    async (item) => {
+        const currentPrices = await getCurrentPriceListPrices(item.id);
+        // Check ALL THREE price tiers for changes
+        const needsUpdate = 
+            currentPrices.silver !== item.omsPrices.silver ||
+            currentPrices.gold !== item.omsPrices.gold ||
+            currentPrices.platinum !== item.omsPrices.platinum;
+        const isNew = newProducts.some(p => p.sku === item.sku);
         
+        return { ...item, currentPrices, needsUpdate, isNew };
+    }
+);
         const updates = priceCheckResults.filter(r => r.needsUpdate);
         currentSync.matched = updates.length;
         
@@ -673,8 +734,7 @@ async function runSync() {
             const batchNum = Math.floor(i / BATCH_UPDATE_SIZE) + 1;
             
             addLog(`\n📦 Bulk batch ${batchNum}/${totalBatches} (${batch.length} variants)...`, "info");
-            
-            const updatePriceList = async (listId, type, getPrice) => {
+                      const updatePriceList = async (listId, getPrice) => {
                 const prices = batch.map(item => ({
                     variantId: item.id,
                     price: { amount: String(getPrice(item)), currencyCode: "USD" }
@@ -689,7 +749,7 @@ async function runSync() {
                 const result = await shopifyGraphQL(mutation, { id: listId, prices });
                 if (result?.priceListFixedPricesAdd?.userErrors?.length) {
                     result.priceListFixedPricesAdd.userErrors.forEach(err => {
-                        addLog(`   Bulk ${type} error: ${err.message}`, "error");
+                        addLog(`   Bulk price error: ${err.message}`, "error");
                     });
                     return false;
                 }
@@ -698,11 +758,10 @@ async function runSync() {
             
             try {
                 const results = await Promise.all([
-                    updatePriceList(SILVER_PRICE_LIST, "Silver", (item) => item.omsPrices.silver),
-                    updatePriceList(GOLD_PRICE_LIST, "Gold", (item) => item.omsPrices.gold),
-                    updatePriceList(PLATINUM_PRICE_LIST, "Platinum", (item) => item.omsPrices.platinum)
+                    updatePriceList(SILVER_PRICE_LIST, (item) => item.omsPrices.silver),
+                    updatePriceList(GOLD_PRICE_LIST, (item) => item.omsPrices.gold),
+                    updatePriceList(PLATINUM_PRICE_LIST, (item) => item.omsPrices.platinum)
                 ]);
-                
                 if (results.every(r => r === true)) {
                     for (const item of batch) {
                         addPriceChange(
@@ -905,7 +964,7 @@ async function syncSingleSku(sku, source = "webhook") {
         }
         
         // Update all three price lists
-        const updatePriceList = async (listId, type, price) => {
+               const updatePriceList = async (listId, price) => {
             const mutation = `
                 mutation($id: ID!, $prices: [PriceListPriceInput!]!) {
                     priceListFixedPricesAdd(priceListId: $id, prices: $prices) {
@@ -929,9 +988,9 @@ async function syncSingleSku(sku, source = "webhook") {
         };
         
         const results = await Promise.all([
-            updatePriceList(SILVER_PRICE_LIST, "Silver", omsPrices.silver),
-            updatePriceList(GOLD_PRICE_LIST, "Gold", omsPrices.gold),
-            updatePriceList(PLATINUM_PRICE_LIST, "Platinum", omsPrices.platinum)
+            updatePriceList(SILVER_PRICE_LIST, omsPrices.silver),
+            updatePriceList(GOLD_PRICE_LIST, omsPrices.gold),
+            updatePriceList(PLATINUM_PRICE_LIST, omsPrices.platinum)
         ]);
         
         if (results.every(r => r === true)) {
@@ -1009,7 +1068,7 @@ async function detectManualPriceChanges() {
                 addLog(`   🔄 Force reverting to OMS prices...`, "info");
                 
                 // Update price lists to OMS values
-                const updatePriceList = async (listId, type, price) => {
+                                const updatePriceList = async (listId, price) => {
                     const mutation = `
                         mutation($id: ID!, $prices: [PriceListPriceInput!]!) {
                             priceListFixedPricesAdd(priceListId: $id, prices: $prices) {
@@ -1030,9 +1089,9 @@ async function detectManualPriceChanges() {
                 };
                 
                 const results = await Promise.all([
-                    updatePriceList(SILVER_PRICE_LIST, "Silver", omsPrices.silver),
-                    updatePriceList(GOLD_PRICE_LIST, "Gold", omsPrices.gold),
-                    updatePriceList(PLATINUM_PRICE_LIST, "Platinum", omsPrices.platinum)
+                    updatePriceList(SILVER_PRICE_LIST, omsPrices.silver),
+                    updatePriceList(GOLD_PRICE_LIST, omsPrices.gold),
+                    updatePriceList(PLATINUM_PRICE_LIST, omsPrices.platinum)
                 ]);
                 
                 if (results.every(r => r === true)) {
@@ -1396,11 +1455,13 @@ async function startFullSync() {
                             const div = document.createElement('div');
                             div.className = 'change-entry';
                             div.innerHTML = \`
-                                <div class="change-sku">📦 \${change.sku} \${change.isNew ? '<span class="badge-new">NEW</span>' : ''}</div>
-                                <div class="change-title">\${change.title || change.sku}</div>
-                                <div class="price-change">Silver: $\${change.newPrices.silver} (was $\${change.oldPrices.silver})</div>
-                                <div style="color:#555;font-size:9px;">\${new Date(change.timestamp).toLocaleString()}</div>
-                            \`;
+    <div class="change-sku">📦 \${change.sku} \${change.isNew ? '<span class="badge-new">NEW</span>' : ''}</div>
+    <div class="change-title">\${change.title || change.sku}</div>
+    <div class="price-change">💰 Silver: $\${change.newPrices.silver} (was $\${change.oldPrices.silver})</div>
+    <div class="price-change">🥇 Gold: $\${change.newPrices.gold} (was $\${change.oldPrices.gold})</div>
+    <div class="price-change">💎 Platinum: $\${change.newPrices.platinum} (was $\${change.oldPrices.platinum})</div>
+    <div style="color:#555;font-size:9px; margin-top: 5px;">\${new Date(change.timestamp).toLocaleString()}</div>
+\`;
                             changesDiv.appendChild(div);
                         });
                     }
