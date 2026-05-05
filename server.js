@@ -645,6 +645,49 @@ app.post("/sync", async (req, res) => {
     runSync().catch(console.error);
     res.json({ success: true, message: "Sync started" });
 });
+// ================= FULL SYNC ENDPOINT =================
+app.post("/full-sync", async (req, res) => {
+    if (isRunning) {
+        return res.json({ success: false, error: "Sync already in progress" });
+    }
+    
+    // Clear the sync state to force full sync of all products
+    addLog("📦 FULL SYNC MODE - Will sync all products regardless of previous sync", "warning");
+    
+    // Temporarily clear synced SKUs to force full sync
+    const wasRunning = isRunning;
+    if (!wasRunning) {
+        // Store original state
+        const originalSyncedSkus = [...lastSyncState.syncedSkus];
+        
+        // Clear synced SKUs to force full sync
+        lastSyncState.syncedSkus = [];
+        addLog("📋 Cleared sync history - will sync ALL products", "info");
+        
+        // Run full sync
+        runSync().catch(console.error);
+        
+        // Restore after sync completes (will be updated by runSync anyway)
+        setTimeout(() => {
+            if (lastSyncState.syncedSkus.length === 0 && originalSyncedSkus.length > 0) {
+                lastSyncState.syncedSkus = originalSyncedSkus;
+            }
+        }, 1000);
+    } else {
+        runSync().catch(console.error);
+    }
+    
+    res.json({ success: true, message: "Full sync started" });
+});// ================= INCREMENTAL SYNC ENDPOINT =================
+app.post("/incremental-sync", async (req, res) => {
+    if (isRunning) {
+        return res.json({ success: false, error: "Sync already in progress" });
+    }
+    
+    addLog("⚡ INCREMENTAL SYNC MODE - Will only sync changed products", "info");
+    runSync().catch(console.error);
+    res.json({ success: true, message: "Incremental sync started" });
+});
 
 app.get("/sync-stream", (req, res) => {
     res.setHeader('Content-Type', 'text/event-stream');
@@ -758,12 +801,13 @@ app.get("/", (req, res) => {
             <div class="terminal">
                 <div class="terminal-header">
                     <div class="terminal-title">OMS SYNC [READY]</div>
-                    <div class="button-group">
-                        <button class="cmd-btn" onclick="startSync()">▶ START SYNC</button>
-                        <button class="cmd-btn" onclick="window.location.href='/auth'">🔑 AUTH</button>
-                        <button class="cmd-btn" onclick="clearAll()">🗑 CLEAR ALL</button>
-                        <button class="cmd-btn" onclick="refreshHealth()">🔄 HEALTH</button>
-                    </div>
+                  <div class="button-group">
+    <button class="cmd-btn" onclick="startFullSync()" style="background:#00AA33; color:#0C0C0C;">🔄 FULL SYNC</button>
+    <button class="cmd-btn" onclick="startSync()">⚡ INCREMENTAL SYNC</button>
+    <button class="cmd-btn" onclick="window.location.href='/auth'">🔑 AUTH</button>
+    <button class="cmd-btn" onclick="clearAll()">🗑 CLEAR ALL</button>
+    <button class="cmd-btn" onclick="refreshHealth()">🔄 HEALTH</button>
+</div>
                 </div>
                 
                 <div class="stats-grid">
@@ -844,12 +888,12 @@ app.get("/", (req, res) => {
                 }
                 
                 async function startSync() {
-                    addLog('MANUAL_SYNC_TRIGGERED', 'info');
-                    const response = await fetch('/sync', { method: 'POST' });
-                    const data = await response.json();
-                    if (data.success) addLog('SYNC_STARTED', 'success');
-                    else addLog('SYNC_FAILED: ' + data.error, 'error');
-                }
+    addLog('⚡ INCREMENTAL_SYNC_TRIGGERED', 'info');
+    const response = await fetch('/incremental-sync', { method: 'POST' });
+    const data = await response.json();
+    if (data.success) addLog('INCREMENTAL_SYNC_STARTED', 'success');
+    else addLog('SYNC_FAILED: ' + data.error, 'error');
+}
                 
                 async function loadPriceChanges() {
                     const response = await fetch('/price-changes');
@@ -989,6 +1033,8 @@ app.get("/auth/callback", async (req, res) => {
 
 // ================= AUTO-START AND SCHEDULE =================
 
+// ================= AUTO-START AND SCHEDULE =================
+
 loadSyncState();
 
 setTimeout(async () => {
@@ -1003,12 +1049,12 @@ setTimeout(async () => {
     }
 }, 2000);
 
-// Schedule sync every 6 hours
-cron.schedule("0 */6 * * *", async () => {
+// Schedule sync every 15 minutes (recommended for balance of speed and API limits)
+cron.schedule("*/15 * * * *", async () => {
     if (!isRunning) {
         const isValid = await ensureValidToken();
         if (isValid) {
-            addLog("\n🤖 Scheduled sync triggered (every 6 hours)...", "info");
+            addLog("\n🤖 Scheduled sync triggered (every 15 minutes)...", "info");
             runSync().catch(console.error);
         }
     }
