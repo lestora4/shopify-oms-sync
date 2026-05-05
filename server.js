@@ -377,7 +377,181 @@ async function processConcurrently(items, concurrency, processorFn) {
     
     return results;
 }
+// ================= EFFICIENT OMS POLLING (Only changed products) =================
 
+let lastOmsPollTime = null;
+
+// Load last poll time from file
+function loadLastPollTime() {
+    const file = "./last_poll.json";
+    if (fs.existsSync(file)) {
+        try {
+            const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+            lastOmsPollTime = data.lastPollTime;
+            addLog(`📅 Loaded last OMS poll time: ${lastOmsPollTime}`, "info");
+        } catch (err) {}
+    }
+    if (!lastOmsPollTime) {
+        lastOmsPollTime = new Date(Date.now() - 5*60000).toISOString();
+    }
+}
+
+function saveLastPollTime() {
+    const file = "./last_poll.json";
+    fs.writeFileSync(file, JSON.stringify({ lastPollTime: new Date().toISOString() }, null, 2));
+}
+
+// Get only products changed since last poll
+async function getChangedOmsProducts() {
+    try {
+        const fromTime = lastOmsPollTime;
+        const url = `https://api.omspavo.com/products?updated_at_from=${encodeURIComponent(fromTime)}&limit=100`;
+        
+        const response = await fetch(url, {
+            headers: { "X-Pavo-Token": OMS_API_KEY }
+        });
+        
+        if (!response.ok) return [];
+        
+        const data = await response.json();
+        return data.products || [];
+        
+    } catch (err) {
+        return [];
+    }
+}
+
+// Sync only changed products (efficient - used by auto-polling)
+async function syncChangedProducts() {
+    if (isRunning) {
+        addLog("⏭️ Sync already in progress, skipping auto-poll", "warning");
+        return;
+    }
+    
+    addLog("🔍 Auto-poll: Checking for changed OMS products...", "info");
+    
+    const changedProducts = await getChangedOmsProducts();
+    
+    if (changedProducts.length === 0) {
+        addLog("✅ No changed products found", "success");
+        saveLastPollTime();
+        return;
+    }
+    
+    addLog(`📦 Found ${changedProducts.length} changed product(s) in OMS`, "success");
+    
+    isRunning = true;
+    let successCount = 0;
+    let errorCount = 0;
+    
+    try {
+        for (const product of changedProducts) {
+            const sku = product.item_num;
+            addLog(`🔄 Processing changed product: ${sku}`, "info");
+            
+            // Get OMS prices
+            const omsPrices = await lookupSkuInOMS(sku);
+            if (!omsPrices) {
+                addLog(`   ❌ ${sku} not found in OMS variants`, "error");
+                errorCount++;
+                continue;
+            }
+            
+            // Find Shopify variant
+            const query = `
+                query($sku: String!) {
+                    productVariants(first: 1, query: $sku) {
+                        edges {
+                            node {
+                                id
+                                product { title }
+                            }
+                        }
+                    }
+                }
+            `;
+            
+            const data = await shopifyGraphQL(query, { sku: `sku:'${sku}'` });
+            const variant = data?.productVariants?.edges?.[0]?.node;
+            
+            if (!variant) {
+                addLog(`   ❌ ${sku} not found in Shopify`, "error");
+                errorCount++;
+                continue;
+            }
+            
+            // Get current prices
+            const currentPrices = await getCurrentPriceListPrices(variant.id);
+            
+            // Check if update needed
+            if (currentPrices.silver === omsPrices.silver && 
+                currentPrices.gold === omsPrices.gold && 
+                currentPrices.platinum === omsPrices.platinum) {
+                addLog(`   ✅ ${sku} prices already match`, "success");
+                successCount++;
+                continue;
+            }
+            
+            // Update price lists
+            const updatePriceList = async (listId, type, price) => {
+                const mutation = `
+                    mutation($id: ID!, $prices: [PriceListPriceInput!]!) {
+                        priceListFixedPricesAdd(priceListId: $id, prices: $prices) {
+                            userErrors { field message }
+                        }
+                    }
+                `;
+                
+                const result = await shopifyGraphQL(mutation, {
+                    id: listId,
+                    prices: [{
+                        variantId: variant.id,
+                        price: { amount: String(price), currencyCode: "USD" }
+                    }]
+                });
+                
+                return !result?.priceListFixedPricesAdd?.userErrors?.length;
+            };
+            
+            const results = await Promise.all([
+                updatePriceList(SILVER_PRICE_LIST, "Silver", omsPrices.silver),
+                updatePriceList(GOLD_PRICE_LIST, "Gold", omsPrices.gold),
+                updatePriceList(PLATINUM_PRICE_LIST, "Platinum", omsPrices.platinum)
+            ]);
+            
+            if (results.every(r => r === true)) {
+                addPriceChange(sku, variant.product?.title || sku, currentPrices, omsPrices);
+                addLog(`   ✅ Updated ${sku} - Silver:$${omsPrices.silver}`, "success");
+                successCount++;
+            } else {
+                addLog(`   ❌ Failed to update ${sku}`, "error");
+                errorCount++;
+            }
+        }
+        
+        saveLastPollTime();
+        addLog(`📊 Auto-poll results: ✅ ${successCount} updated, ❌ ${errorCount} failed`, "info");
+        
+    } catch (err) {
+        addLog(`❌ Auto-poll sync failed: ${err.message}`, "error");
+    } finally {
+        isRunning = false;
+    }
+}
+
+// Start efficient auto-polling (every 2 minutes - only changed products)
+function startEfficientPolling() {
+    loadLastPollTime();
+    
+    setInterval(async () => {
+        if (!isRunning) {
+            await syncChangedProducts();
+        }
+    }, 120000); // 2 minutes
+    
+    addLog("🔔 Started efficient OMS polling (every 2 minutes)", "success");
+    addLog("   📅 Only fetches products changed since last poll", "info");
+}
 // ================= MAIN SYNC FUNCTION =================
 
 async function runSync() {
@@ -627,6 +801,306 @@ app.post("/webhook/product-create", async (req, res) => {
     }
     res.status(200).send("OK");
 });
+// ================= OMS WEBHOOKS FOR INSTANT SYNC =================
+
+// OMS Product Update Webhook - Called by OMS when ANY product changes
+app.post("/webhooks/oms/product-update", async (req, res) => {
+    addLog(`⚡ INSTANT: OMS product update webhook received!`, "success");
+    const { item_num, sku, updated_at } = req.body;
+    
+    const targetSku = sku || item_num;
+    if (targetSku) {
+        addLog(`   → Instantly syncing SKU: ${targetSku}`, "info");
+        // Sync just this one SKU immediately
+        syncSingleSku(targetSku, "OMS webhook").catch(console.error);
+    } else {
+        addLog(`   ⚠️ No SKU provided, running quick check`, "warning");
+        const recentSkus = await getRecentOmsChanges();
+        if (recentSkus.length > 0) {
+            for (const sku of recentSkus.slice(0, 5)) {
+                await syncSingleSku(sku, "batch webhook");
+            }
+        }
+    }
+    
+    res.status(200).send("OK");
+});
+
+// OMS Price Sheet Webhook - For price-specific changes
+app.post("/webhooks/oms/price-change", async (req, res) => {
+    addLog(`💰 INSTANT: OMS price change webhook received!`, "success");
+    const { item_num, sku, price_sheet_id, value } = req.body;
+    
+    const targetSku = sku || item_num;
+    if (targetSku) {
+        addLog(`   → Instantly updating price for: ${targetSku}`, "info");
+        syncSingleSku(targetSku, "OMS price change").catch(console.error);
+    }
+    
+    res.status(200).send("OK");
+});
+
+// OMS New Product Webhook
+app.post("/webhooks/oms/product-create", async (req, res) => {
+    addLog(`🆕 INSTANT: New product created in OMS!`, "success");
+    const { item_num, sku } = req.body;
+    
+    const targetSku = sku || item_num;
+    if (targetSku) {
+        addLog(`   → Instantly syncing new product: ${targetSku}`, "info");
+        syncSingleSku(targetSku, "new OMS product").catch(console.error);
+    }
+    
+    res.status(200).send("OK");
+});
+
+// Single SKU sync function for instant updates
+async function syncSingleSku(sku, source = "webhook") {
+    if (isRunning) {
+        addLog(`⏭️ Deferring ${sku} - full sync in progress`, "warning");
+        return;
+    }
+    
+    addLog(`⚡ INSTANT SYNC: ${sku} from ${source}`, "info");
+    
+    try {
+        // Find Shopify variant by SKU
+        const query = `
+            query($sku: String!) {
+                productVariants(first: 1, query: $sku) {
+                    edges {
+                        node {
+                            id
+                            product { title }
+                        }
+                    }
+                }
+            }
+        `;
+        
+        const data = await shopifyGraphQL(query, { sku: `sku:'${sku}'` });
+        const variant = data?.productVariants?.edges?.[0]?.node;
+        
+        if (!variant) {
+            addLog(`❌ SKU ${sku} not found in Shopify`, "error");
+            return;
+        }
+        
+        // Get OMS prices
+        const omsPrices = await lookupSkuInOMS(sku);
+        if (!omsPrices) {
+            addLog(`❌ SKU ${sku} not found in OMS`, "error");
+            return;
+        }
+        
+        // Get current Shopify prices
+        const currentPrices = await getCurrentPriceListPrices(variant.id);
+        
+        // Check if update needed
+        if (currentPrices.silver === omsPrices.silver && 
+            currentPrices.gold === omsPrices.gold && 
+            currentPrices.platinum === omsPrices.platinum) {
+            addLog(`✅ SKU ${sku} prices already match OMS`, "success");
+            return;
+        }
+        
+        // Update all three price lists
+        const updatePriceList = async (listId, type, price) => {
+            const mutation = `
+                mutation($id: ID!, $prices: [PriceListPriceInput!]!) {
+                    priceListFixedPricesAdd(priceListId: $id, prices: $prices) {
+                        userErrors { field message }
+                    }
+                }
+            `;
+            
+            const result = await shopifyGraphQL(mutation, {
+                id: listId,
+                prices: [{
+                    variantId: variant.id,
+                    price: { amount: String(price), currencyCode: "USD" }
+                }]
+            });
+            
+            if (result?.priceListFixedPricesAdd?.userErrors?.length) {
+                return false;
+            }
+            return true;
+        };
+        
+        const results = await Promise.all([
+            updatePriceList(SILVER_PRICE_LIST, "Silver", omsPrices.silver),
+            updatePriceList(GOLD_PRICE_LIST, "Gold", omsPrices.gold),
+            updatePriceList(PLATINUM_PRICE_LIST, "Platinum", omsPrices.platinum)
+        ]);
+        
+        if (results.every(r => r === true)) {
+            addPriceChange(sku, variant.product?.title || sku, currentPrices, omsPrices);
+            addLog(`✅ INSTANT SYNC COMPLETE: ${sku} updated`, "success");
+        } else {
+            addLog(`❌ Failed to update ${sku}`, "error");
+        }
+        
+    } catch (err) {
+        addLog(`❌ Instant sync failed for ${sku}: ${err.message}`, "error");
+    }
+}
+// ================= DETECT AND REVERT MANUAL PRICE CHANGES =================
+
+// Track known prices to detect manual changes
+let knownPrices = new Map(); // SKU -> { silver, gold, platinum, lastSeen }
+
+// Load known prices from file
+function loadKnownPrices() {
+    const file = "./known_prices.json";
+    if (fs.existsSync(file)) {
+        try {
+            const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+            knownPrices = new Map(Object.entries(data));
+            addLog(`📁 Loaded ${knownPrices.size} known SKU prices`, "info");
+        } catch (err) {}
+    }
+}
+
+// Save known prices to file
+function saveKnownPrices() {
+    const file = "./known_prices.json";
+    const obj = Object.fromEntries(knownPrices);
+    fs.writeFileSync(file, JSON.stringify(obj, null, 2));
+}
+
+// Check for manual price changes in Shopify
+async function detectManualPriceChanges() {
+    addLog("🔍 Scanning for manual price changes in Shopify...", "info");
+    
+    try {
+        // Fetch all Shopify variants (limit to 50 per check to avoid overloading)
+        const shopifyVariants = await getAllShopifyVariants();
+        let manualChangesDetected = 0;
+        let checked = 0;
+        
+        for (const variant of shopifyVariants) {
+            const sku = variant.sku;
+            if (!sku) continue;
+            
+            checked++;
+            if (checked % 10 === 0) {
+                addLog(`   Progress: ${checked}/${Math.min(shopifyVariants.length, 50)}`, "info");
+            }
+            
+            // Get current prices from Shopify
+            const currentPrices = await getCurrentPriceListPrices(variant.id);
+            
+            // Get OMS prices
+            const omsPrices = await lookupSkuInOMS(sku);
+            if (!omsPrices) continue;
+            
+            // Check if current prices match OMS
+            const matchesOMS = 
+                currentPrices.silver === omsPrices.silver &&
+                currentPrices.gold === omsPrices.gold &&
+                currentPrices.platinum === omsPrices.platinum;
+            
+            if (!matchesOMS) {
+                // Manual change detected! Force revert
+                addLog(`⚠️ MANUAL PRICE CHANGE DETECTED for ${sku}`, "warning");
+                addLog(`   Current: S$${currentPrices.silver} G$${currentPrices.gold} P$${currentPrices.platinum}`, "warning");
+                addLog(`   OMS: S$${omsPrices.silver} G$${omsPrices.gold} P$${omsPrices.platinum}`, "info");
+                addLog(`   🔄 Force reverting to OMS prices...`, "info");
+                
+                // Update price lists to OMS values
+                const updatePriceList = async (listId, type, price) => {
+                    const mutation = `
+                        mutation($id: ID!, $prices: [PriceListPriceInput!]!) {
+                            priceListFixedPricesAdd(priceListId: $id, prices: $prices) {
+                                userErrors { field message }
+                            }
+                        }
+                    `;
+                    
+                    const result = await shopifyGraphQL(mutation, {
+                        id: listId,
+                        prices: [{
+                            variantId: variant.id,
+                            price: { amount: String(price), currencyCode: "USD" }
+                        }]
+                    });
+                    
+                    return !result?.priceListFixedPricesAdd?.userErrors?.length;
+                };
+                
+                const results = await Promise.all([
+                    updatePriceList(SILVER_PRICE_LIST, "Silver", omsPrices.silver),
+                    updatePriceList(GOLD_PRICE_LIST, "Gold", omsPrices.gold),
+                    updatePriceList(PLATINUM_PRICE_LIST, "Platinum", omsPrices.platinum)
+                ]);
+                
+                if (results.every(r => r === true)) {
+                    addLog(`   ✅ Force reverted ${sku} back to OMS prices`, "success");
+                    manualChangesDetected++;
+                    
+                    // Record the forced change
+                    addPriceChange(sku, variant.title || sku, currentPrices, omsPrices, false);
+                } else {
+                    addLog(`   ❌ Failed to revert ${sku}`, "error");
+                }
+                
+                // Small delay to avoid rate limits
+                await new Promise(r => setTimeout(r, 200));
+            }
+        }
+        
+        if (manualChangesDetected > 0) {
+            addLog(`📊 Detected and reverted ${manualChangesDetected} manual price change(s)`, "success");
+        } else {
+            addLog("✅ No manual price changes detected", "success");
+        }
+        
+        saveKnownPrices();
+        
+    } catch (err) {
+        addLog(`❌ Manual price detection failed: ${err.message}`, "error");
+    }
+}
+
+// Start manual price monitoring (every 5 minutes)
+function startManualPriceMonitoring() {
+    loadKnownPrices();
+    
+    setInterval(async () => {
+        if (!isRunning) {
+            await detectManualPriceChanges();
+        }
+    }, 300000); // 5 minutes
+    
+    addLog("🔔 Started manual price change monitoring (every 5 minutes)", "success");
+    addLog("   📝 Any manual price changes will be forcefully reverted to OMS", "warning");
+}
+
+// ================= MANUAL PRICE CHECK ENDPOINT =================
+app.post("/check-manual-prices", async (req, res) => {
+    if (isRunning) {
+        return res.json({ success: false, error: "Sync already in progress" });
+    }
+    
+    addLog("🔍 Manual price check triggered", "info");
+    detectManualPriceChanges().catch(console.error);
+    res.json({ success: true, message: "Manual price check started" });
+});
+// Helper: Get recent OMS changes
+async function getRecentOmsChanges() {
+    try {
+        const fromTime = new Date(Date.now() - 5*60000).toISOString();
+        const response = await fetch(`https://api.omspavo.com/products?updated_at_from=${fromTime}&limit=20`, {
+            headers: { "X-Pavo-Token": OMS_API_KEY }
+        });
+        if (!response.ok) return [];
+        const data = await response.json();
+        return (data.products || []).map(p => p.item_num).filter(Boolean);
+    } catch (err) {
+        return [];
+    }
+}
 
 // ================= API ENDPOINTS =================
 
@@ -801,9 +1275,10 @@ app.get("/", (req, res) => {
             <div class="terminal">
                 <div class="terminal-header">
                     <div class="terminal-title">OMS SYNC [READY]</div>
-                  <div class="button-group">
+               <div class="button-group">
     <button class="cmd-btn" onclick="startFullSync()" style="background:#00AA33; color:#0C0C0C;">🔄 FULL SYNC</button>
     <button class="cmd-btn" onclick="startSync()">⚡ INCREMENTAL SYNC</button>
+    <button class="cmd-btn" onclick="checkManualPrices()">🔍 CHECK MANUAL PRICES</button>
     <button class="cmd-btn" onclick="window.location.href='/auth'">🔑 AUTH</button>
     <button class="cmd-btn" onclick="clearAll()">🗑 CLEAR ALL</button>
     <button class="cmd-btn" onclick="refreshHealth()">🔄 HEALTH</button>
@@ -893,6 +1368,15 @@ app.get("/", (req, res) => {
     const data = await response.json();
     if (data.success) addLog('INCREMENTAL_SYNC_STARTED', 'success');
     else addLog('SYNC_FAILED: ' + data.error, 'error');
+}async function checkManualPrices() {
+    addLog('🔍 CHECKING FOR MANUAL PRICE CHANGES...', 'info');
+    const response = await fetch('/check-manual-prices', { method: 'POST' });
+    const data = await response.json();
+    if (data.success) {
+        addLog('✅ Manual price check completed. Any changes will be reverted.', 'success');
+    } else {
+        addLog('❌ Check failed: ' + data.error, 'error');
+    }
 }
                 
                 async function loadPriceChanges() {
@@ -1030,37 +1514,40 @@ app.get("/auth/callback", async (req, res) => {
         res.status(500).send(`❌ Auth Error: ${err.message}`);
     }
 });
-
-// ================= AUTO-START AND SCHEDULE =================
-
-// ================= AUTO-START AND SCHEDULE =================
+// ================= AUTO-START WITH EFFICIENT POLLING =================
 
 loadSyncState();
+loadLastPollTime();
 
 setTimeout(async () => {
     const isValid = await ensureValidToken();
     if (isValid) {
-        addLog("🔐 TOKEN_VALID - Auto-starting sync in 5 seconds...", "info");
+        addLog("🔐 TOKEN_VALID - Starting EFFICIENT SYNC MODE", "success");
+        addLog("   🔄 FULL SYNC: Available via button (manual)", "info");
+        addLog("   ⚡ AUTO-POLL: Every 2 minutes (only changed products)", "info");
+        addLog("   💰 Detects price changes automatically", "info");
+        addLog("   🆕 Detects new products automatically", "info");
+        
+        // Start efficient polling (only changed products)
+        startEfficientPolling();
+        // Start manual price monitoring (reverts manual changes)
+startManualPriceMonitoring();
+        
+        // Run initial sync to establish baseline
+        addLog("📡 Running initial sync to establish baseline...", "info");
         setTimeout(() => {
             runSync().catch(console.error);
         }, 5000);
+        
     } else {
         addLog("🔑 NO_VALID_TOKEN - Visit /auth to authenticate", "warning");
     }
 }, 2000);
 
-// Schedule sync every 15 minutes (recommended for balance of speed and API limits)
-cron.schedule("*/15 * * * *", async () => {
-    if (!isRunning) {
-        const isValid = await ensureValidToken();
-        if (isValid) {
-            addLog("\n🤖 Scheduled sync triggered (every 15 minutes)...", "info");
-            runSync().catch(console.error);
-        }
-    }
-});
+// Remove the old cron - we use efficient polling instead
+// No need for 15-minute cron anymore (polling handles it)
 
-// Check token expiry daily and auto-refresh
+// Keep token refresh check (once daily)
 cron.schedule("0 0 * * *", async () => {
     if (tokenData.refresh_token && tokenData.expires_at) {
         const daysUntilExpiry = (tokenData.expires_at - Date.now()) / (1000 * 60 * 60 * 24);
@@ -1070,7 +1557,6 @@ cron.schedule("0 0 * * *", async () => {
         }
     }
 });
-
 // ================= START SERVER =================
 
 const PORT = process.env.PORT || 3000;
