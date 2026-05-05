@@ -14,6 +14,15 @@
   "dependencies": {
     "axios": "^1.15.2",
     "express": "^5.2.1",
+    "node-cron": "^4.2.1",
     "node-fetch": "^2.7.0"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lestoratech/shopify-oms-sync.git"
+  },
+  "bugs": {
+    "url": "https://github.com/lestoratech/shopify-oms-sync/issues"
+  },
+  "homepage": "https://github.com/lestoratech/shopify-oms-sync#readme"
 }

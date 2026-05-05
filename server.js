@@ -1,723 +1,1049 @@
 const express = require("express");
-const fetch = (...args) => import('node-fetch').then(({default: fetch}) => fetch(...args));
-const fs = require('fs');
+const fetch = require("node-fetch");
+const cron = require("node-cron");
+const fs = require("fs");
+const path = require("path");
 
 const app = express();
 app.use(express.json());
 
 // ================= CONFIG =================
 
-// 🔑 Shopify OAuth Credentials
-const CLIENT_ID = "16268ecdaf07c5ebef41d27e9f78c7db";
-const CLIENT_SECRET = "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";
 const SHOP = "mello-distribution-test.myshopify.com";
+const CLIENT_ID = "16268ecdaf07c5ebef41d27e9f78c7db";
+const CLIENT_SECRET = "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";
+const SCOPES = "read_products,write_products,read_price_rules,write_price_rules,read_webhooks,write_webhooks";
+// For Render - use environment variable for redirect URI
+const REDIRECT_URI = process.env.REDIRECT_URI || "http://localhost:3000/auth/callback";
+const TOKEN_FILE = "./token.json";
+const SYNC_STATE_FILE = "./sync_state.json";
 
-// 🏷️ Price Lists
-const SILVER_PRICE_LIST = "gid://shopify/PriceList/32255705394";
-const GOLD_PRICE_LIST = "gid://shopify/PriceList/32255738162";
-const PLATINUM_PRICE_LIST = "gid://shopify/PriceList/32255770930";
+const SILVER_PRICE_LIST = "gid://shopify/PriceList/32259899698";
+const GOLD_PRICE_LIST = "gid://shopify/PriceList/32259866930";
+const PLATINUM_PRICE_LIST = "gid://shopify/PriceList/32259834162";
 
-// 🔑 OMS
-const OMS_API_URL = "https://api.omspavo.com/products";
 const OMS_API_KEY = "1ae0b8a9-520b-28c2-737b-ec5f52198036";
 
-const BATCH_SIZE = 50;
-const CACHE_FILE = './price-cache.json';
+// ================= PERFORMANCE CONFIG =================
+const CONCURRENT_REQUESTS = 30; // Ultra fast - 30 parallel lookups
+const BATCH_UPDATE_SIZE = 100;   // Shopify batch update size (max 100)
+const REQUEST_DELAY_MS = 10;     // Minimal delay for maximum speed
 
-// ================= PERSISTENT CACHE =================
+// ================= TOKEN MANAGEMENT WITH EXPIRY =================
+let tokenData = {
+    access_token: null,
+    expires_at: null,
+    refresh_token: null
+};
 
-function loadCache() {
-  try {
-    if (fs.existsSync(CACHE_FILE)) {
-      const data = fs.readFileSync(CACHE_FILE, 'utf8');
-      const cached = JSON.parse(data);
-      console.log(`📦 Loaded cache: ${Object.keys(cached.prices || {}).length} products`);
-      return cached;
+let isRunning = false;
+let syncLogs = [];
+let priceChanges = [];
+let unmatchedSkus = [];
+let currentSync = null;
+let lastSyncState = { lastSyncTime: null, lastProductCount: 0, syncedSkus: [] };
+
+// ================= LOAD/SAVE SYNC STATE =================
+
+function loadSyncState() {
+    if (fs.existsSync(SYNC_STATE_FILE)) {
+        try {
+            lastSyncState = JSON.parse(fs.readFileSync(SYNC_STATE_FILE, 'utf8'));
+            addLog(`📁 Loaded sync state: ${lastSyncState.syncedSkus.length} SKUs previously synced`, "info");
+        } catch (err) {
+            addLog(`⚠️ Could not load sync state: ${err.message}`, "warning");
+        }
     }
-  } catch (err) {
-    console.log("⚠️ No cache file found, starting fresh");
-  }
-  return { timestamp: null, prices: {} };
 }
 
-function saveCache(cache) {
-  try {
-    fs.writeFileSync(CACHE_FILE, JSON.stringify(cache, null, 2));
-    console.log(`💾 Saved cache: ${Object.keys(cache.prices).length} products`);
-  } catch (err) {
-    console.error("❌ Failed to save cache:", err.message);
-  }
-}
-
-// Initialize cache
-let lastSyncData = loadCache();
-
-// ================= OAUTH TOKEN MANAGEMENT =================
-
-let token = null;
-let tokenExpiry = 0;
-
-async function getAccessToken() {
-  if (token && Date.now() < tokenExpiry) {
-    return token;
-  }
-
-  console.log("🔄 Fetching new Shopify access token...");
-
-  const url = `https://${SHOP}/admin/oauth/access_token`;
-  const params = new URLSearchParams({
-    grant_type: "client_credentials",
-    client_id: CLIENT_ID,
-    client_secret: CLIENT_SECRET
-  });
-
-  try {
-    const response = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/x-www-form-urlencoded"
-      },
-      body: params
-    });
-
-    const data = await response.json();
-
-    if (!data.access_token) {
-      throw new Error(`Token error: ${JSON.stringify(data)}`);
+function saveSyncState() {
+    try {
+        fs.writeFileSync(SYNC_STATE_FILE, JSON.stringify(lastSyncState, null, 2));
+    } catch (err) {
+        addLog(`⚠️ Could not save sync state: ${err.message}`, "warning");
     }
-
-    token = data.access_token;
-    tokenExpiry = Date.now() + (data.expires_in - 300) * 1000;
-
-    console.log("✅ Access token obtained successfully");
-    return token;
-  } catch (error) {
-    console.error("❌ Failed to get access token:", error.message);
-    throw error;
-  }
 }
 
-// ================= SKU NORMALIZER =================
+// ================= NORMALIZATION =================
+
 function normalizeSku(sku) {
-  if (!sku) return "";
-  return sku
-    .toString()
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, "")
-    .replace(/_box$/g, "")
-    .replace(/-/g, "")
-    .replace(/_/g, "");
+    if (!sku) return "";
+    return sku
+        .toUpperCase()
+        .trim()
+        .replace(/_(BOX|CASE|box|case)$/i, '')
+        .replace(/_\d+$/, '')
+        .replace(/\s+/g, '')
+        .replace(/[-_]+/g, '-')
+        .replace(/^[-_]+|[-_]+$/g, '');
 }
 
-// ================= GET ALL SHOPIFY VARIANTS =================
+function getPrice(prices, type) {
+    if (!prices || !prices.business_type) return 0;
+    const searchType = type.toLowerCase();
+    const found = prices.business_type.find(x => x.type && x.type.toLowerCase() === searchType);
+    
+    if (!found && searchType === "platinum") {
+        const platFound = prices.business_type.find(x => x.type && x.type.toLowerCase() === "platimum");
+        return platFound ? Number(platFound.value) : 0;
+    }
+    return found ? Number(found.value) : 0;
+}
+
+function addLog(message, type = "info") {
+    const timestamp = new Date().toISOString();
+    const logEntry = { timestamp, message, type };
+    syncLogs.unshift(logEntry);
+    if (syncLogs.length > 500) syncLogs.pop();
+    console.log(`[${type.toUpperCase()}] ${message}`);
+}
+
+function addPriceChange(sku, title, oldPrices, newPrices, isNew = false) {
+    priceChanges.unshift({
+        timestamp: new Date().toISOString(),
+        sku: sku,
+        title: title,
+        oldPrices: oldPrices,
+        newPrices: newPrices,
+        isNew: isNew,
+        changes: {
+            silver: oldPrices.silver !== newPrices.silver,
+            gold: oldPrices.gold !== newPrices.gold,
+            platinum: oldPrices.platinum !== newPrices.platinum
+        }
+    });
+    if (priceChanges.length > 500) priceChanges.pop();
+}
+
+function addUnmatchedSku(sku, title, reason) {
+    unmatchedSkus.unshift({
+        timestamp: new Date().toISOString(),
+        sku: sku,
+        title: title,
+        reason: reason,
+        normalized: normalizeSku(sku)
+    });
+    if (unmatchedSkus.length > 500) unmatchedSkus.pop();
+}
+
+// ================= TOKEN HELPERS WITH EXPIRY =================
+
+function saveToken(accessToken, expiresIn = null, refreshToken = null) {
+    tokenData = {
+        access_token: accessToken,
+        expires_at: expiresIn ? Date.now() + (expiresIn * 1000) : null,
+        refresh_token: refreshToken || null
+    };
+    fs.writeFileSync(TOKEN_FILE, JSON.stringify(tokenData));
+}
+
+function getToken() {
+    if (!fs.existsSync(TOKEN_FILE)) return null;
+    
+    try {
+        const saved = JSON.parse(fs.readFileSync(TOKEN_FILE, 'utf8'));
+        tokenData = saved;
+        
+        // Check if token is expired
+        if (tokenData.expires_at && Date.now() >= tokenData.expires_at) {
+            addLog("⚠️ Token expired! Please re-authenticate.", "warning");
+            return null;
+        }
+        
+        return tokenData.access_token;
+    } catch (err) {
+        return null;
+    }
+}
+
+async function refreshAccessToken() {
+    if (!tokenData.refresh_token) {
+        addLog("⚠️ No refresh token available. Please re-authenticate.", "warning");
+        return false;
+    }
+    
+    addLog("🔄 Refreshing Shopify access token...", "info");
+    
+    try {
+        const response = await fetch(`https://${SHOP}/admin/oauth/access_token`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                client_id: CLIENT_ID,
+                client_secret: CLIENT_SECRET,
+                refresh_token: tokenData.refresh_token,
+                grant_type: "refresh_token"
+            })
+        });
+        
+        const data = await response.json();
+        
+        if (data.access_token) {
+            saveToken(data.access_token, data.expires_in, data.refresh_token);
+            addLog("✅ Token refreshed successfully!", "success");
+            return true;
+        } else {
+            addLog(`❌ Token refresh failed: ${JSON.stringify(data)}`, "error");
+            return false;
+        }
+    } catch (err) {
+        addLog(`❌ Token refresh error: ${err.message}`, "error");
+        return false;
+    }
+}
+
+async function ensureValidToken() {
+    const token = getToken();
+    if (!token) {
+        addLog("❌ No valid token. Please authenticate at /auth", "error");
+        return false;
+    }
+    return true;
+}
+
+// ================= SHOPIFY GRAPHQL =================
+
+async function shopifyGraphQL(query, variables = {}, retryCount = 0) {
+    const token = getToken();
+    if (!token) throw new Error("No token found. Please authenticate first.");
+
+    try {
+        const res = await fetch(`https://${SHOP}/admin/api/2025-01/graphql.json`, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "X-Shopify-Access-Token": token,
+            },
+            body: JSON.stringify({ query, variables }),
+        });
+
+        const json = await res.json();
+        if (json.errors) throw new Error(`Shopify Error: ${JSON.stringify(json.errors)}`);
+        return json.data;
+    } catch (err) {
+        if (retryCount < 3) {
+            addLog(`Retrying Shopify (${retryCount + 1}/3)...`, "warning");
+            await new Promise(r => setTimeout(r, 5000));
+            return shopifyGraphQL(query, variables, retryCount + 1);
+        }
+        throw err;
+    }
+}
+
+// ================= GET SHOPIFY VARIANTS =================
 
 async function getAllShopifyVariants() {
-  const t = await getAccessToken();
-
-  let hasNextPage = true;
-  let cursor = null;
-  let all = [];
-
-  while (hasNextPage) {
-    const query = `
-    query ($cursor: String) {
-      productVariants(first: 250, after: $cursor) {
-        edges {
-          cursor
-          node {
-            id
-            sku
-          }
+    addLog("🛍️ Fetching all Shopify variants with SKUs...", "info");
+    
+    const variants = [];
+    let hasNext = true;
+    let cursor = null;
+    
+    while (hasNext) {
+        const query = `query($cursor: String) { 
+            productVariants(first: 250, after: $cursor) {
+                edges { 
+                    cursor
+                    node { 
+                        id 
+                        sku
+                        product {
+                            id
+                            title
+                        }
+                    } 
+                }
+                pageInfo { 
+                    hasNextPage 
+                    endCursor 
+                }
+            }
+        }`;
+        
+        const data = await shopifyGraphQL(query, { cursor });
+        const edges = data.productVariants?.edges || [];
+        
+        for (const edge of edges) {
+            if (edge.node.sku) {
+                variants.push({
+                    id: edge.node.id,
+                    sku: edge.node.sku,
+                    productId: edge.node.product?.id,
+                    title: edge.node.product?.title || edge.node.sku
+                });
+            }
         }
-        pageInfo {
-          hasNextPage
-        }
-      }
-    }`;
+        
+        hasNext = data.productVariants?.pageInfo?.hasNextPage || false;
+        cursor = data.productVariants?.pageInfo?.endCursor;
+        addLog(`   Fetched ${variants.length} variants with SKUs...`, "info");
+    }
+    
+    addLog(`✅ Total Shopify variants with SKUs: ${variants.length}`, "success");
+    return variants;
+}
 
-    const res = await fetch(`https://${SHOP}/admin/api/2024-10/graphql.json`, {
-      method: "POST",
-      headers: {
-        "X-Shopify-Access-Token": t,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({ query, variables: { cursor } })
-    });
+// ================= LOOKUP SKU IN OMS =================
 
-    const json = await res.json();
-    const edges = json.data.productVariants.edges;
-
-    edges.forEach(e => {
-      if (e.node.sku) {
-        all.push({
-          id: e.node.id,
-          sku: e.node.sku
+async function lookupSkuInOMS(sku) {
+    try {
+        const url = `https://api.omspavo.com/product/variants?item_num=${encodeURIComponent(sku)}`;
+        const response = await fetch(url, {
+            headers: { "X-Pavo-Token": OMS_API_KEY },
         });
-      }
-    });
-
-    hasNextPage = json.data.productVariants.pageInfo.hasNextPage;
-
-    if (hasNextPage) {
-      cursor = edges[edges.length - 1].cursor;
+        
+        if (!response.ok) return null;
+        
+        const data = await response.json();
+        if (!data.variants || data.variants.length === 0) return null;
+        
+        const pieceVariant = data.variants.find(v => 
+            v.unit?.type?.toLowerCase() === "piece" || 
+            (!v.sku.includes("_box") && !v.sku.includes("_case"))
+        );
+        
+        if (!pieceVariant) return null;
+        
+        return {
+            silver: getPrice(pieceVariant.prices, "Silver"),
+            gold: getPrice(pieceVariant.prices, "Gold"),
+            platinum: getPrice(pieceVariant.prices, "Platinum"),
+            originalSku: pieceVariant.sku
+        };
+        
+    } catch (err) {
+        return null;
     }
-  }
-
-  console.log(`📦 Shopify Variants Loaded: ${all.length}`);
-  return all;
 }
 
-// ================= GET VARIANT ID BY SKU =================
+// ================= GET CURRENT PRICES =================
 
-async function getVariantId(sku) {
-  const t = await getAccessToken();
-  
-  const query = `
-  query ($sku: String!) {
-    productVariants(first: 1, query: $sku) {
-      edges {
-        node {
-          id
-        }
-      }
+async function getCurrentPriceListPrices(variantId) {
+    try {
+        const query = `
+            query($variantId: ID!) {
+                priceList(id: "${SILVER_PRICE_LIST}") {
+                    priceListPrices(first: 1, variantId: $variantId) {
+                        edges {
+                            node {
+                                price {
+                                    amount
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        `;
+        
+        const data = await shopifyGraphQL(query, { variantId });
+        const silverPrice = data?.priceList?.priceListPrices?.edges?.[0]?.node?.price?.amount || 0;
+        return { silver: parseFloat(silverPrice), gold: 0, platinum: 0 };
+    } catch (err) {
+        return { silver: 0, gold: 0, platinum: 0 };
     }
-  }`;
-  
-  const res = await fetch(`https://${SHOP}/admin/api/2024-10/graphql.json`, {
-    method: "POST",
-    headers: {
-      "X-Shopify-Access-Token": t,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({ 
-      query, 
-      variables: { sku: `sku:${sku}` } 
-    })
-  });
-  
-  const json = await res.json();
-  const edges = json.data.productVariants.edges;
-  
-  return edges.length > 0 ? edges[0].node.id : null;
 }
 
-// ================= UPDATE SINGLE PRICE =================
+// ================= CONCURRENT PROCESSING =================
 
-async function updatePrice(priceListId, variantId, price) {
-  const t = await getAccessToken();
-
-  const mutation = `
-  mutation {
-    priceListFixedPricesAdd(
-      priceListId: "${priceListId}",
-      prices: [{
-        variantId: "${variantId}",
-        price: { amount: "${price}", currencyCode: USD }
-      }]
-    ) {
-      userErrors { message }
-    }
-  }`;
-
-  const res = await fetch(`https://${SHOP}/admin/api/2024-10/graphql.json`, {
-    method: "POST",
-    headers: {
-      "X-Shopify-Access-Token": t,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({ query: mutation })
-  });
-
-  const json = await res.json();
-
-  if (json?.data?.priceListFixedPricesAdd?.userErrors?.length > 0) {
-    console.log("❌ Price Error:", json.data.priceListFixedPricesAdd.userErrors);
-  } else {
-    console.log(`✅ B2B Catalog updated → ${variantId} = $${price}`);
-  }
-}
-
-// ================= BULK UPDATE PRICES =================
-
-async function updatePricesBulk(priceListId, updates, tierName) {
-  if (updates.length === 0) return 0;
-  
-  const t = await getAccessToken();
-  let updatedCount = 0;
-  
-  console.log(`   💰 Updating ${updates.length} prices for ${tierName}...`);
-  
-  for (let i = 0; i < updates.length; i += BATCH_SIZE) {
-    const batch = updates.slice(i, i + BATCH_SIZE);
+async function processConcurrently(items, concurrency, processorFn) {
+    const results = [];
+    const batches = [];
     
-    const mutation = `
-      mutation priceListFixedPricesAdd($input: PriceListFixedPricesAddInput!) {
-        priceListFixedPricesAdd(input: $input) {
-          userErrors { field message }
-        }
-      }
-    `;
+    for (let i = 0; i < items.length; i += concurrency) {
+        batches.push(items.slice(i, i + concurrency));
+    }
     
-    const variables = {
-      input: {
-        priceListId: priceListId,
-        prices: batch.map(u => ({
-          variantId: u.variantId,
-          price: { amount: u.price.toString(), currencyCode: "USD" }
-        }))
-      }
+    let processed = 0;
+    const total = items.length;
+    
+    for (const batch of batches) {
+        const batchResults = await Promise.all(
+            batch.map(async (item) => {
+                const result = await processorFn(item);
+                processed++;
+                if (processed % 20 === 0 || processed === total) {
+                    addLog(`   Progress: ${processed}/${total} (${Math.round(processed/total*100)}%)`, "info");
+                }
+                return result;
+            })
+        );
+        results.push(...batchResults);
+        
+        if (REQUEST_DELAY_MS > 0) {
+            await new Promise(r => setTimeout(r, REQUEST_DELAY_MS));
+        }
+    }
+    
+    return results;
+}
+
+// ================= MAIN SYNC FUNCTION =================
+
+async function runSync() {
+    if (isRunning) {
+        addLog("⚠️ Sync already in progress, skipping...", "warning");
+        return;
+    }
+    
+    // Check token before starting
+    const isValid = await ensureValidToken();
+    if (!isValid) return;
+    
+    isRunning = true;
+    const startTime = Date.now();
+    unmatchedSkus = [];
+    
+    currentSync = {
+        startTime: startTime,
+        status: "running",
+        shopifyVariants: 0,
+        matched: 0,
+        updated: 0,
+        errors: 0,
+        newProducts: 0,
+        unmatched: 0
     };
     
-    try {
-      const res = await fetch(`https://${SHOP}/admin/api/2024-10/graphql.json`, {
-        method: "POST",
-        headers: {
-          "X-Shopify-Access-Token": t,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({ query: mutation, variables })
-      });
-      
-      const json = await res.json();
-      
-      if (json?.data?.priceListFixedPricesAdd?.userErrors?.length > 0) {
-        console.log(`   ⚠️ Batch error:`, json.data.priceListFixedPricesAdd.userErrors[0].message);
-      } else {
-        updatedCount += batch.length;
-        if (i % (BATCH_SIZE * 5) === 0 || i + BATCH_SIZE >= updates.length) {
-          console.log(`   📦 ${tierName}: ${updatedCount}/${updates.length} updated`);
-        }
-      }
-    } catch (err) {
-      console.error(`   ❌ Batch failed:`, err.message);
-    }
-    
-    await new Promise(resolve => setTimeout(resolve, 100));
-  }
-  
-  console.log(`   ✅ ${tierName}: ${updatedCount} prices updated`);
-  return updatedCount;
-}
-
-// ================= FETCH OMS =================
-
-async function fetchOMS() {
-  console.log("📦 Fetching ALL OMS products...");
-  
-  let allProducts = [];
-  let offset = 0;
-  let total = null;
-  let pagesFetched = 0;
-  const limit = 100;
-  
-  while (true) {
-    const url = `${OMS_API_URL}?limit=${limit}&offset=${offset}`;
+    addLog("=".repeat(70), "info");
+    addLog("🚀 STARTING OMS TO SHOPIFY PRICE SYNC", "info");
+    addLog(`⚡ Concurrent lookups: ${CONCURRENT_REQUESTS} parallel requests`, "info");
+    addLog("=".repeat(70), "info");
     
     try {
-      const res = await fetch(url, {
-        headers: { "X-Pavo-Token": OMS_API_KEY }
-      });
-      
-      const data = await res.json();
-      pagesFetched++;
-      
-      if (total === null && data.total) {
-        total = data.total;
-        console.log(`   Total products in OMS: ${total}`);
-      }
-      
-      if (!data.products || data.products.length === 0) {
-        break;
-      }
-      
-      allProducts.push(...data.products);
-      console.log(`   Page ${pagesFetched}: +${data.products.length} (Total: ${allProducts.length}/${total})`);
-      
-      if (total && allProducts.length >= total) {
-        console.log(`   ✅ Fetched all ${total} products`);
-        break;
-      }
-      
-      offset += limit;
-      await new Promise(resolve => setTimeout(resolve, 50));
-      
+        addLog("\n📡 Step 1: Fetching Shopify variants...", "info");
+        const shopifyVariants = await getAllShopifyVariants();
+        currentSync.shopifyVariants = shopifyVariants.length;
+        addLog(`✅ Fetched ${shopifyVariants.length} Shopify variants`, "success");
+        
+        const syncedSkusSet = new Set(lastSyncState.syncedSkus.map(s => normalizeSku(s)));
+        const newProducts = shopifyVariants.filter(v => !syncedSkusSet.has(normalizeSku(v.sku)));
+        
+        if (newProducts.length > 0) {
+            addLog(`\n🆕 Found ${newProducts.length} NEW products since last sync!`, "success");
+            currentSync.newProducts = newProducts.length;
+        }
+        
+        addLog(`\n🎯 Step 2: Looking up ${shopifyVariants.length} SKUs in OMS (${CONCURRENT_REQUESTS} concurrent)...`, "info");
+        
+        const lookupResults = await processConcurrently(
+            shopifyVariants,
+            CONCURRENT_REQUESTS,
+            async (variant) => {
+                const omsPrices = await lookupSkuInOMS(variant.sku);
+                
+                if (omsPrices) {
+                    return { ...variant, omsPrices, found: true };
+                } else {
+                    addUnmatchedSku(variant.sku, variant.title, "Not found in OMS or no piece unit");
+                    return { ...variant, omsPrices: null, found: false };
+                }
+            }
+        );
+        
+        const foundInOMS = lookupResults.filter(r => r.found);
+        const notFound = lookupResults.filter(r => !r.found);
+        currentSync.unmatched = notFound.length;
+        
+        addLog(`\n✅ Found in OMS: ${foundInOMS.length}`, "success");
+        addLog(`❌ Not found in OMS: ${notFound.length}`, notFound.length > 0 ? "warning" : "success");
+        
+        if (foundInOMS.length === 0) {
+            addLog("\n❌ No products found in OMS. Check SKU mappings.", "error");
+            return;
+        }
+        
+        addLog(`\n💰 Step 3: Checking current Shopify prices for ${foundInOMS.length} products...`, "info");
+        
+        const priceCheckResults = await processConcurrently(
+            foundInOMS,
+            CONCURRENT_REQUESTS,
+            async (item) => {
+                const currentPrices = await getCurrentPriceListPrices(item.id);
+                const needsUpdate = currentPrices.silver !== item.omsPrices.silver;
+                const isNew = newProducts.some(p => p.sku === item.sku);
+                
+                return { ...item, currentPrices, needsUpdate, isNew };
+            }
+        );
+        
+        const updates = priceCheckResults.filter(r => r.needsUpdate);
+        currentSync.matched = updates.length;
+        
+        addLog(`\n📊 Results:`, "info");
+        addLog(`   ✅ Products needing update: ${updates.length}`, "success");
+        addLog(`   🆕 New products: ${newProducts.length}`, "info");
+        addLog(`   ❌ Unmatched SKUs: ${notFound.length}`, "warning");
+        
+        if (updates.length === 0) {
+            addLog("\n✅ All products are in sync with OMS!", "success");
+            
+            lastSyncState.lastSyncTime = new Date().toISOString();
+            lastSyncState.lastProductCount = shopifyVariants.length;
+            lastSyncState.syncedSkus = shopifyVariants.map(v => normalizeSku(v.sku));
+            saveSyncState();
+            
+            const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+            addLog(`\n⏱️  Total sync time: ${duration} seconds`, "success");
+            return;
+        }
+        
+        addLog(`\n💾 Step 4: Bulk updating ${updates.length} products...`, "info");
+        
+        let successCount = 0;
+        let errorCount = 0;
+        const totalBatches = Math.ceil(updates.length / BATCH_UPDATE_SIZE);
+        
+        for (let i = 0; i < updates.length; i += BATCH_UPDATE_SIZE) {
+            const batch = updates.slice(i, i + BATCH_UPDATE_SIZE);
+            const batchNum = Math.floor(i / BATCH_UPDATE_SIZE) + 1;
+            
+            addLog(`\n📦 Bulk batch ${batchNum}/${totalBatches} (${batch.length} variants)...`, "info");
+            
+            const updatePriceList = async (listId, type, getPrice) => {
+                const prices = batch.map(item => ({
+                    variantId: item.id,
+                    price: { amount: String(getPrice(item)), currencyCode: "USD" }
+                }));
+                
+                const mutation = `mutation($id: ID!, $prices: [PriceListPriceInput!]!) { 
+                    priceListFixedPricesAdd(priceListId: $id, prices: $prices) { 
+                        userErrors { field message } 
+                    } 
+                }`;
+                
+                const result = await shopifyGraphQL(mutation, { id: listId, prices });
+                if (result?.priceListFixedPricesAdd?.userErrors?.length) {
+                    result.priceListFixedPricesAdd.userErrors.forEach(err => {
+                        addLog(`   Bulk ${type} error: ${err.message}`, "error");
+                    });
+                    return false;
+                }
+                return true;
+            };
+            
+            try {
+                const results = await Promise.all([
+                    updatePriceList(SILVER_PRICE_LIST, "Silver", (item) => item.omsPrices.silver),
+                    updatePriceList(GOLD_PRICE_LIST, "Gold", (item) => item.omsPrices.gold),
+                    updatePriceList(PLATINUM_PRICE_LIST, "Platinum", (item) => item.omsPrices.platinum)
+                ]);
+                
+                if (results.every(r => r === true)) {
+                    for (const item of batch) {
+                        addPriceChange(
+                            item.sku,
+                            item.title,
+                            item.currentPrices,
+                            item.omsPrices,
+                            item.isNew
+                        );
+                        successCount++;
+                    }
+                    addLog(`   ✅ Batch ${batchNum} complete (${successCount}/${updates.length})`, "success");
+                } else {
+                    errorCount += batch.length;
+                }
+            } catch (err) {
+                errorCount += batch.length;
+                addLog(`   ❌ Batch ${batchNum} failed: ${err.message}`, "error");
+            }
+        }
+        
+        currentSync.updated = successCount;
+        currentSync.errors = errorCount;
+        
+        lastSyncState.lastSyncTime = new Date().toISOString();
+        lastSyncState.lastProductCount = shopifyVariants.length;
+        lastSyncState.syncedSkus = shopifyVariants.map(v => normalizeSku(v.sku));
+        saveSyncState();
+        
+        const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+        
+        addLog("\n" + "=".repeat(70), "info");
+        addLog("📊 SYNC COMPLETED", "info");
+        addLog("=".repeat(70), "info");
+        addLog(`⏱️  Duration: ${duration} seconds (${(duration/60).toFixed(1)} minutes)`, "success");
+        addLog(`🛍️ Shopify variants: ${shopifyVariants.length}`, "info");
+        addLog(`🆕 New products: ${newProducts.length}`, "info");
+        addLog(`✅ Updated: ${successCount}`, "success");
+        addLog(`❌ Unmatched SKUs: ${notFound.length}`, notFound.length > 0 ? "warning" : "info");
+        addLog(`⚡ Speed: ~${Math.round(shopifyVariants.length / (duration/60))} products/minute`, "success");
+        
+        if (notFound.length > 0) {
+            addLog(`\n📋 First 10 unmatched SKUs:`, "warning");
+            notFound.slice(0, 10).forEach(item => {
+                addLog(`   - ${item.sku} (${item.title || 'N/A'})`, "warning");
+            });
+            
+            fs.writeFileSync("./unmatched_skus.json", JSON.stringify(notFound.map(s => ({
+                sku: s.sku,
+                title: s.title,
+                normalized: normalizeSku(s.sku)
+            })), null, 2));
+            addLog(`\n📁 Full unmatched list saved to: unmatched_skus.json`, "info");
+        }
+        
+        addLog("=".repeat(70) + "\n", "info");
+        
     } catch (err) {
-      console.error(`   Error:`, err.message);
-      break;
+        addLog(`❌ Sync failed: ${err.message}`, "error");
+        console.error(err);
+    } finally {
+        isRunning = false;
+        currentSync.status = "completed";
+        currentSync.endTime = Date.now();
     }
-  }
-  
-  console.log(`✅ Fetched ${allProducts.length} products in ${pagesFetched} pages`);
-  
-  // Transform OMS data
-  const transformedProducts = [];
-  
-  for (let product of allProducts) {
-    let itemNum = product['ITEM NO'] || product.item_num || product.sku;
-    if (!itemNum) continue;
-    
-    let silver = 0, gold = 0, platinum = 0;
-    
-    if (product['Silver'] !== undefined) silver = parseFloat(product['Silver']) || 0;
-    else if (product.silver !== undefined) silver = parseFloat(product.silver) || 0;
-    
-    if (product['Gold'] !== undefined) gold = parseFloat(product['Gold']) || 0;
-    else if (product.gold !== undefined) gold = parseFloat(product.gold) || 0;
-    
-    if (product['Platimum'] !== undefined) platinum = parseFloat(product['Platimum']) || 0;
-    else if (product.platinum !== undefined) platinum = parseFloat(product.platinum) || 0;
-    
-    if (product.prices && product.prices.business_type) {
-      for (let p of product.prices.business_type) {
-        if (p.type === "Silver") silver = p.value;
-        if (p.type === "Gold") gold = p.value;
-        if (p.type === "Platimum") platinum = p.value;
-      }
-    }
-    
-    transformedProducts.push({
-      item_num: itemNum,
-      prices: {
-        business_type: [
-          { type: "Silver", value: silver },
-          { type: "Gold", value: gold },
-          { type: "Platimum", value: platinum }
-        ]
-      }
-    });
-  }
-  
-  return transformedProducts;
 }
 
-// ================= OPTIMIZED SYNC WITH CHANGE DETECTION =================
+// ================= WEBHOOK FOR REAL-TIME UPDATES =================
 
-async function syncAll() {
-  const startTime = Date.now();
-  console.log("\n🚀 SYNC CHECK STARTED...");
-  console.log(`⏰ Time: ${new Date().toLocaleString()}\n`);
-
-  let matched = 0;
-  let notInOMS = 0;
-  let pricesChanged = 0;
-  let newProducts = 0;
-
-  try {
-    const omsProducts = await fetchOMS();
-    const shopifyVariants = await getAllShopifyVariants();
-    const totalVariants = shopifyVariants.length;
-
-    // Build OMS Map
-    let omsMap = {};
-
-    for (let product of omsProducts) {
-      if (!product || !product.item_num) continue;
-      
-      let silver = 0, gold = 0, platinum = 0;
-      
-      if (product.prices && product.prices.business_type) {
-        for (let p of product.prices.business_type) {
-          if (p.type === "Silver") silver = p.value;
-          if (p.type === "Gold") gold = p.value;
-          if (p.type === "Platimum") platinum = p.value;
-        }
-      }
-      
-      const normalizedSku = normalizeSku(product.item_num);
-      omsMap[normalizedSku] = { silver, gold, platinum };
-    }
-
-    console.log(`📊 Statistics:`);
-    console.log(`   OMS SKUs: ${Object.keys(omsMap).length}`);
-    console.log(`   Shopify variants: ${totalVariants}`);
-    console.log(`   Cached products: ${Object.keys(lastSyncData.prices).length}`);
+async function registerWebhook() {
+    const token = getToken();
+    if (!token) return;
     
-    // Prepare updates
-    let silverUpdates = [];
-    let goldUpdates = [];
-    let platinumUpdates = [];
-    let unmatchedSkus = [];
-    let newProductSkus = [];
+    // For Render - use your Render URL
+    const webhookUrl = process.env.RENDER_URL 
+        ? `${process.env.RENDER_URL}/webhook/product-update`
+        : "https://your-render-url.onrender.com/webhook/product-update";
     
-    console.log(`\n🔄 Checking for changes...`);
-    
-    for (let i = 0; i < shopifyVariants.length; i++) {
-      const v = shopifyVariants[i];
-      
-      if ((i + 1) % 500 === 0 || i + 1 === totalVariants) {
-        const percent = (((i + 1) / totalVariants) * 100).toFixed(1);
-        console.log(`   Progress: ${i + 1}/${totalVariants} (${percent}%) - Changes: ${pricesChanged}, New: ${newProducts}`);
-      }
-      
-      const normalizedSku = normalizeSku(v.sku);
-      const oms = omsMap[normalizedSku];
-      
-      if (!oms) {
-        notInOMS++;
-        if (unmatchedSkus.length < 20) {
-          unmatchedSkus.push(v.sku);
-        }
-        continue;
-      }
-      
-      matched++;
-      
-      // Check if product exists in cache
-      const cached = lastSyncData.prices[v.id];
-      const isNewProduct = !cached;
-      
-      if (isNewProduct) {
-        newProducts++;
-        if (newProductSkus.length < 20) {
-          newProductSkus.push(v.sku);
-        }
-      }
-      
-      // Check price changes
-      const silverChanged = !cached || cached.silver !== oms.silver;
-      const goldChanged = !cached || cached.gold !== oms.gold;
-      const platinumChanged = !cached || cached.platinum !== oms.platinum;
-      
-      if (silverChanged || goldChanged || platinumChanged) {
-        pricesChanged++;
-        
-        if (silverChanged) silverUpdates.push({ variantId: v.id, price: oms.silver });
-        if (goldChanged) goldUpdates.push({ variantId: v.id, price: oms.gold });
-        if (platinumChanged) platinumUpdates.push({ variantId: v.id, price: oms.platinum });
-        
-        // Update cache
-        lastSyncData.prices[v.id] = { 
-          silver: oms.silver, 
-          gold: oms.gold, 
-          platinum: oms.platinum 
-        };
-      }
-    }
-    
-    if (unmatchedSkus.length > 0) {
-      console.log(`\n📋 Unmatched Shopify SKUs (${unmatchedSkus.length} total):`);
-      unmatchedSkus.slice(0, 10).forEach(sku => {
-        console.log(`   ❌ ${sku}`);
-      });
-    }
-    
-    if (newProductSkus.length > 0) {
-      console.log(`\n🆕 New Products Detected (${newProducts}):`);
-      newProductSkus.slice(0, 10).forEach(sku => {
-        console.log(`   ✅ ${sku}`);
-      });
-    }
-    
-    console.log(`\n📊 Change Summary:`);
-    console.log(`   Total matched: ${matched}`);
-    console.log(`   New products: ${newProducts}`);
-    console.log(`   Price changes: ${pricesChanged}`);
-    console.log(`   Silver updates: ${silverUpdates.length}`);
-    console.log(`   Gold updates: ${goldUpdates.length}`);
-    console.log(`   Platinum updates: ${platinumUpdates.length}`);
-    
-    // Send updates ONLY if there are changes
-    let totalUpdates = 0;
-    
-    if (silverUpdates.length > 0 || goldUpdates.length > 0 || platinumUpdates.length > 0) {
-      console.log(`\n📤 Sending updates to Shopify...`);
-      
-      if (silverUpdates.length > 0) {
-        totalUpdates += await updatePricesBulk(SILVER_PRICE_LIST, silverUpdates, "Silver");
-      }
-      if (goldUpdates.length > 0) {
-        totalUpdates += await updatePricesBulk(GOLD_PRICE_LIST, goldUpdates, "Gold");
-      }
-      if (platinumUpdates.length > 0) {
-        totalUpdates += await updatePricesBulk(PLATINUM_PRICE_LIST, platinumUpdates, "Platinum");
-      }
-    } else {
-      console.log(`\n💡 No changes detected. Skipping updates.`);
-    }
-    
-    // Update timestamp and save cache
-    lastSyncData.timestamp = new Date();
-    saveCache(lastSyncData);
-    
-    const totalTime = ((Date.now() - startTime) / 1000).toFixed(1);
-    
-    console.log("\n==================================");
-    console.log("📊 FINAL REPORT");
-    console.log(`✅ Processed: ${totalVariants} Shopify variants`);
-    console.log(`✅ Matched with OMS: ${matched}`);
-    console.log(`🆕 New products found: ${newProducts}`);
-    console.log(`🔄 Price changes: ${pricesChanged}`);
-    console.log(`✅ B2B Catalog updates: ${totalUpdates}`);
-    console.log(`⚠️  Not in OMS: ${notInOMS}`);
-    console.log(`⏱️  Total time: ${totalTime} seconds`);
-    
-    if (pricesChanged === 0 && newProducts === 0) {
-      console.log(`💡 No changes - catalog prices are up to date!`);
-    }
-    console.log("==================================");
-    console.log(`🎉 SYNC COMPLETED at ${new Date().toLocaleTimeString()}\n`);
-    
-    return { matched, newProducts, pricesChanged, totalUpdates, notInOMS };
-
-  } catch (err) {
-    console.error("❌ Sync error:", err.message);
-    console.error(err.stack);
-  }
+    addLog(`🔌 Would register webhook at: ${webhookUrl}`, "info");
+    addLog("💡 For real-time updates, configure webhook in Shopify admin", "info");
 }
 
-// ================= DEBUG ENDPOINTS =================
+// Webhook endpoint for real-time product updates
+app.post("/webhook/product-update", async (req, res) => {
+    addLog(`🔔 Product update webhook received!`, "info");
+    // Trigger sync for just this product if needed
+    res.status(200).send("OK");
+});
 
-app.get("/debug/missing", async (req, res) => {
-  try {
-    const omsProducts = await fetchOMS();
-    const shopifyVariants = await getAllShopifyVariants();
-    
-    let omsMap = {};
-    for (let product of omsProducts) {
-      if (product.item_num) {
-        omsMap[normalizeSku(product.item_num)] = true;
-      }
+app.post("/webhook/product-create", async (req, res) => {
+    addLog(`🆕 New product creation webhook received!`, "success");
+    // Trigger full sync to pick up new product
+    if (!isRunning) {
+        addLog("🔄 Triggering sync for new product...", "info");
+        runSync().catch(console.error);
     }
-    
-    let missing = [];
-    for (let v of shopifyVariants) {
-      if (!omsMap[normalizeSku(v.sku)]) {
-        missing.push(v.sku);
-      }
-    }
-    
-    res.json({
-      totalMissing: missing.length,
-      missingSkus: missing
-    });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
+    res.status(200).send("OK");
 });
 
-app.get("/debug/status", (req, res) => {
-  res.json({
-    lastSync: lastSyncData.timestamp,
-    cachedProducts: Object.keys(lastSyncData.prices).length,
-    cacheFileExists: fs.existsSync(CACHE_FILE)
-  });
+// ================= API ENDPOINTS =================
+
+app.get("/unmatched-skus", (req, res) => {
+    res.json(unmatchedSkus.slice(0, 200));
 });
 
-// ================= WEBHOOKS =================
-
-app.post("/webhook", async (req, res) => {
-  console.log("📩 Webhook received - triggering sync");
-  syncAll().catch(console.error);
-  res.send("OK");
+app.get("/price-changes", (req, res) => {
+    res.json(priceChanges.slice(0, 200));
 });
-
-// ================= MANUAL SYNC ENDPOINT =================
 
 app.post("/sync", async (req, res) => {
-  const result = await syncAll();
-  res.json({ status: "Sync completed", timestamp: new Date(), result });
+    if (isRunning) {
+        return res.json({ success: false, error: "Sync already in progress" });
+    }
+    runSync().catch(console.error);
+    res.json({ success: true, message: "Sync started" });
+});
+
+app.get("/sync-stream", (req, res) => {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    
+    const sendStats = () => {
+        const stats = {
+            matched: currentSync?.matched || lastSyncState.syncedSkus.length || 0,
+            updated: currentSync?.updated || 0,
+            errors: currentSync?.errors || 0,
+            newProducts: currentSync?.newProducts || 0,
+            unmatched: currentSync?.unmatched || 0,
+            status: isRunning ? "running" : (currentSync?.status || "idle"),
+            lastSyncTime: lastSyncState.lastSyncTime
+        };
+        res.write(`data: ${JSON.stringify({ type: 'stats', stats })}\n\n`);
+    };
+    
+    const interval = setInterval(sendStats, 2000);
+    req.on('close', () => clearInterval(interval));
+});
+
+app.get("/sync-status", (req, res) => {
+    res.json({
+        matched: currentSync?.matched || lastSyncState.syncedSkus.length || 0,
+        updated: currentSync?.updated || 0,
+        errors: currentSync?.errors || 0,
+        newProducts: currentSync?.newProducts || 0,
+        unmatched: currentSync?.unmatched || 0,
+        status: isRunning ? "running" : (currentSync?.status || "idle"),
+        lastSyncTime: lastSyncState.lastSyncTime
+    });
 });
 
 // ================= HEALTH CHECK =================
 
 app.get("/health", (req, res) => {
-  res.json({
-    status: "running",
-    timestamp: new Date().toISOString(),
-    tokenValid: token && Date.now() < tokenExpiry,
-    lastSync: lastSyncData.timestamp,
-    cachedProducts: Object.keys(lastSyncData.prices).length
-  });
+    const uptime = process.uptime();
+    const uptimeHours = Math.floor(uptime / 3600);
+    const uptimeMinutes = Math.floor((uptime % 3600) / 60);
+    const uptimeSeconds = Math.floor(uptime % 60);
+    
+    res.json({
+        status: "healthy",
+        timestamp: new Date().toISOString(),
+        uptime: `${uptimeHours}h ${uptimeMinutes}m ${uptimeSeconds}s`,
+        sync: {
+            isRunning: isRunning,
+            lastSync: lastSyncState.lastSyncTime,
+            lastSyncStats: currentSync ? {
+                matched: currentSync.matched,
+                updated: currentSync.updated,
+                errors: currentSync.errors,
+                newProducts: currentSync.newProducts,
+                unmatched: currentSync.unmatched
+            } : null
+        },
+        shopify: { authenticated: !!getToken(), shop: SHOP },
+        oms: { apiConfigured: !!OMS_API_KEY },
+        syncState: {
+            productsSynced: lastSyncState.syncedSkus.length,
+            lastSyncTime: lastSyncState.lastSyncTime
+        }
+    });
 });
 
-// ================= TOKEN REFRESH ENDPOINT =================
-
-app.post("/refresh-token", async (req, res) => {
-  try {
-    token = null;
-    tokenExpiry = 0;
-    await getAccessToken();
-    res.json({ success: true, message: "Token refreshed" });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-// ================= HOMEPAGE =================
+// ================= FRONTEND DASHBOARD =================
 
 app.get("/", (req, res) => {
-  res.send(`
-    <!DOCTYPE html>
-    <html>
-    <head>
-      <title>Shopify-OMS B2B Sync</title>
-      <style>
-        body { font-family: Arial; padding: 20px; max-width: 800px; margin: 0 auto; }
-        .status { color: green; font-weight: bold; }
-        .card { border: 1px solid #ccc; padding: 15px; margin: 10px 0; border-radius: 5px; }
-        button { padding: 10px 20px; background: #007bff; color: white; border: none; border-radius: 5px; cursor: pointer; }
-        pre { background: #f4f4f4; padding: 10px; border-radius: 5px; overflow-x: auto; }
-      </style>
-    </head>
-    <body>
-      <h1>🔄 Shopify-OMS B2B Price Sync</h1>
-      <div class="card">
-        <h2>Status: <span class="status">✅ RUNNING</span></h2>
-        <p>Auto-sync: Every 30 minutes</p>
-        <p>B2B Catalogs: Silver, Gold, Platinum</p>
-      </div>
-      <div class="card">
-        <h2>⚡ Actions</h2>
-        <button onclick="manualSync()">Manual Sync Now</button>
-        <button onclick="refreshStatus()">Refresh Status</button>
-      </div>
-      <div class="card">
-        <h2>📋 Endpoints</h2>
-        <ul>
-          <li><a href="/health">Health Check</a></li>
-          <li><a href="/debug/status">Status</a></li>
-          <li><a href="/debug/missing">Missing SKUs</a></li>
-        </ul>
-      </div>
-      <div class="card">
-        <h2>📋 Sync Log</h2>
-        <pre id="log">Click sync to see results...</pre>
-      </div>
-      <script>
-        async function refreshStatus() {
-          const res = await fetch('/health');
-          const data = await res.json();
-          document.getElementById('log').innerText = JSON.stringify(data, null, 2);
-        }
-        async function manualSync() {
-          document.getElementById('log').innerText = '⏳ Syncing...';
-          const res = await fetch('/sync', {method: 'POST'});
-          const data = await res.json();
-          document.getElementById('log').innerText = JSON.stringify(data, null, 2);
-        }
-        refreshStatus();
-      </script>
-    </body>
-    </html>
-  `);
+    res.send(`
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>OMS → Shopify Price Sync</title>
+            <style>
+                * { margin: 0; padding: 0; box-sizing: border-box; }
+                body { background: #0C0C0C; font-family: 'Consolas', monospace; padding: 20px; color: #00FF41; }
+                .terminal { max-width: 1600px; margin: 0 auto; background: #0C0C0C; border: 1px solid #00FF41; border-radius: 8px; overflow: hidden; }
+                .terminal-header { background: #1a1a1a; padding: 12px 20px; border-bottom: 1px solid #00FF41; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 10px; }
+                .terminal-title { color: #00FF41; font-size: 14px; font-weight: bold; }
+                .terminal-title::before { content: "> "; }
+                .button-group { display: flex; gap: 10px; flex-wrap: wrap; }
+                .cmd-btn { background: transparent; border: 1px solid #00FF41; color: #00FF41; padding: 6px 15px; font-family: monospace; font-size: 12px; cursor: pointer; transition: all 0.2s; }
+                .cmd-btn:hover { background: #00FF41; color: #0C0C0C; }
+                .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 1px; background: #1a1a1a; border-bottom: 1px solid #00FF41; }
+                .stat-card { background: #0C0C0C; padding: 15px; text-align: center; }
+                .stat-value { font-size: 28px; font-weight: bold; color: #00FF41; }
+                .stat-label { font-size: 10px; color: #00AA33; margin-top: 5px; text-transform: uppercase; }
+                .panels { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; background: #1a1a1a; }
+                .panel { background: #0C0C0C; min-height: 400px; display: flex; flex-direction: column; }
+                .panel-header { background: #1a1a1a; padding: 10px 15px; border-bottom: 1px solid #00FF41; font-size: 12px; font-weight: bold; }
+                .logs-container, .changes-container, .unmatched-container { flex: 1; overflow-y: auto; padding: 10px; font-size: 11px; max-height: 500px; }
+                .log-entry { padding: 4px 0; border-bottom: 1px solid #1a3a1a; font-family: monospace; }
+                .log-info { color: #00AAFF; }
+                .log-success { color: #00FF41; }
+                .log-warning { color: #FFAA00; }
+                .log-error { color: #FF4444; }
+                .change-entry, .unmatched-entry { padding: 8px; border-bottom: 1px solid #1a3a1a; }
+                .change-sku, .unmatched-sku { color: #00FF41; font-weight: bold; }
+                .price-change { margin-top: 5px; padding-left: 10px; color: #00FF41; }
+                .badge-new { background: #00FF41; color: #0C0C0C; padding: 2px 6px; border-radius: 4px; font-size: 9px; margin-left: 5px; }
+                .health-check { background: #1a1a1a; padding: 10px 15px; border-top: 1px solid #00FF41; font-size: 11px; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 10px; }
+                @media (max-width: 1024px) { .panels { grid-template-columns: 1fr; } }
+                ::-webkit-scrollbar { width: 8px; }
+                ::-webkit-scrollbar-track { background: #1a1a1a; }
+                ::-webkit-scrollbar-thumb { background: #00FF41; border-radius: 4px; }
+            </style>
+        </head>
+        <body>
+            <div class="terminal">
+                <div class="terminal-header">
+                    <div class="terminal-title">OMS SYNC [READY]</div>
+                    <div class="button-group">
+                        <button class="cmd-btn" onclick="startSync()">▶ START SYNC</button>
+                        <button class="cmd-btn" onclick="window.location.href='/auth'">🔑 AUTH</button>
+                        <button class="cmd-btn" onclick="clearAll()">🗑 CLEAR ALL</button>
+                        <button class="cmd-btn" onclick="refreshHealth()">🔄 HEALTH</button>
+                    </div>
+                </div>
+                
+                <div class="stats-grid">
+                    <div class="stat-card"><div class="stat-value" id="syncedCount">0</div><div class="stat-label">SYNCED SKUs</div></div>
+                    <div class="stat-card"><div class="stat-value" id="updatedCount">0</div><div class="stat-label">UPDATED</div></div>
+                    <div class="stat-card"><div class="stat-value" id="newCount">0</div><div class="stat-label">NEW PRODUCTS</div></div>
+                    <div class="stat-card"><div class="stat-value" id="unmatchedCount">0</div><div class="stat-label">UNMATCHED</div></div>
+                    <div class="stat-card"><div class="stat-value" id="errorCount">0</div><div class="stat-label">ERRORS</div></div>
+                </div>
+                
+                <div class="panels">
+                    <div class="panel">
+                        <div class="panel-header">📋 SYNC_LOGS</div>
+                        <div class="logs-container" id="logs">
+                            <div class="log-entry"><span class="log-info">> OMS SYNC READY</span></div>
+                            <div class="log-entry"><span class="log-info">> 30 concurrent requests | 100 products/batch</span></div>
+                        </div>
+                    </div>
+                    <div class="panel">
+                        <div class="panel-header">💰 PRICE CHANGES & NEW PRODUCTS</div>
+                        <div class="changes-container" id="changes">
+                            <div class="change-entry"><span class="log-info">No changes yet</span></div>
+                        </div>
+                    </div>
+                    <div class="panel">
+                        <div class="panel-header">❌ UNMATCHED SKUs</div>
+                        <div class="unmatched-container" id="unmatched">
+                            <div class="unmatched-entry"><span class="log-info">No unmatched SKUs</span></div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="health-check">
+                    <span id="healthStatus">🟢 HEALTH: OK</span>
+                    <span id="uptime">UPTIME: 0s</span>
+                    <span id="syncStatus">SYNC: IDLE</span>
+                    <span id="lastSync">LAST SYNC: NEVER</span>
+                </div>
+            </div>
+            
+            <script>
+                let eventSource;
+                
+                function connectSSE() {
+                    if (eventSource) eventSource.close();
+                    eventSource = new EventSource('/sync-stream');
+                    eventSource.onmessage = (event) => {
+                        const data = JSON.parse(event.data);
+                        if (data.type === 'log') addLog(data.message, data.level);
+                        else if (data.type === 'stats') updateStats(data.stats);
+                    };
+                }
+                
+                function addLog(message, level) {
+                    const logsDiv = document.getElementById('logs');
+                    const timestamp = new Date().toLocaleTimeString();
+                    const logDiv = document.createElement('div');
+                    logDiv.className = 'log-entry';
+                    logDiv.innerHTML = \`[\${timestamp}] <span class="log-\${level}">\${message}</span>\`;
+                    logsDiv.insertBefore(logDiv, logsDiv.firstChild);
+                    if (logsDiv.children.length > 200) logsDiv.removeChild(logsDiv.lastChild);
+                }
+                
+                function updateStats(stats) {
+                    document.getElementById('syncedCount').textContent = stats.matched || 0;
+                    document.getElementById('updatedCount').textContent = stats.updated || 0;
+                    document.getElementById('newCount').textContent = stats.newProducts || 0;
+                    document.getElementById('unmatchedCount').textContent = stats.unmatched || 0;
+                    document.getElementById('errorCount').textContent = stats.errors || 0;
+                    document.getElementById('syncStatus').innerHTML = stats.status === 'running' ? 'SYNC: 🟢 RUNNING' : 'SYNC: ⚫ IDLE';
+                    if (stats.lastSyncTime) document.getElementById('lastSync').innerHTML = 'LAST SYNC: ' + new Date(stats.lastSyncTime).toLocaleTimeString();
+                    
+                    if (stats.status === 'running') {
+                        document.querySelector('.terminal-title').innerHTML = '> OMS SYNC [RUNNING]';
+                    } else {
+                        document.querySelector('.terminal-title').innerHTML = '> OMS SYNC [READY]';
+                    }
+                }
+                
+                async function startSync() {
+                    addLog('MANUAL_SYNC_TRIGGERED', 'info');
+                    const response = await fetch('/sync', { method: 'POST' });
+                    const data = await response.json();
+                    if (data.success) addLog('SYNC_STARTED', 'success');
+                    else addLog('SYNC_FAILED: ' + data.error, 'error');
+                }
+                
+                async function loadPriceChanges() {
+                    const response = await fetch('/price-changes');
+                    const changes = await response.json();
+                    const changesDiv = document.getElementById('changes');
+                    changesDiv.innerHTML = '';
+                    if (changes.length === 0) {
+                        changesDiv.innerHTML = '<div class="change-entry"><span class="log-info">No changes yet</span></div>';
+                    } else {
+                        changes.slice(0, 50).forEach(change => {
+                            const div = document.createElement('div');
+                            div.className = 'change-entry';
+                            div.innerHTML = \`
+                                <div class="change-sku">📦 \${change.sku} \${change.isNew ? '<span class="badge-new">NEW</span>' : ''}</div>
+                                <div class="change-title">\${change.title || change.sku}</div>
+                                <div class="price-change">Silver: $\${change.newPrices.silver} (was $\${change.oldPrices.silver})</div>
+                                <div style="color:#555;font-size:9px;">\${new Date(change.timestamp).toLocaleString()}</div>
+                            \`;
+                            changesDiv.appendChild(div);
+                        });
+                    }
+                }
+                
+                async function loadUnmatched() {
+                    const response = await fetch('/unmatched-skus');
+                    const unmatched = await response.json();
+                    const unmatchedDiv = document.getElementById('unmatched');
+                    unmatchedDiv.innerHTML = '';
+                    if (unmatched.length === 0) {
+                        unmatchedDiv.innerHTML = '<div class="unmatched-entry"><span class="log-info">No unmatched SKUs</span></div>';
+                    } else {
+                        unmatched.slice(0, 50).forEach(item => {
+                            const div = document.createElement('div');
+                            div.className = 'unmatched-entry';
+                            div.innerHTML = \`
+                                <div class="unmatched-sku">❌ \${item.sku}</div>
+                                <div class="change-title">\${item.title || item.sku}</div>
+                                <div style="color:#555;font-size:9px;">Normalized: \${item.normalized}</div>
+                                <div style="color:#FFAA00;font-size:9px;">Reason: \${item.reason}</div>
+                            \`;
+                            unmatchedDiv.appendChild(div);
+                        });
+                    }
+                }
+                
+                async function clearAll() {
+                    await fetch('/clear-logs', { method: 'POST' });
+                    await fetch('/clear-changes', { method: 'POST' });
+                    document.getElementById('logs').innerHTML = '<div class="log-entry"><span class="log-info">> LOGS_CLEARED</span></div>';
+                    loadPriceChanges();
+                    loadUnmatched();
+                    addLog('ALL_HISTORY_CLEARED', 'warning');
+                }
+                
+                async function refreshHealth() {
+                    const response = await fetch('/health');
+                    const health = await response.json();
+                    document.getElementById('uptime').innerHTML = \`UPTIME: \${health.uptime}\`;
+                }
+                
+                connectSSE();
+                loadPriceChanges();
+                loadUnmatched();
+                refreshHealth();
+                setInterval(loadPriceChanges, 10000);
+                setInterval(loadUnmatched, 10000);
+                setInterval(refreshHealth, 30000);
+            </script>
+        </body>
+        </html>
+    `);
 });
+
+// ================= CLEAR ENDPOINTS =================
+
+app.post("/clear-logs", (req, res) => {
+    syncLogs = [];
+    res.json({ success: true });
+});
+
+app.post("/clear-changes", (req, res) => {
+    priceChanges = [];
+    unmatchedSkus = [];
+    res.json({ success: true });
+});
+
+// ================= AUTH ROUTES =================
+
+app.get("/auth", (req, res) => {
+    const url = `https://${SHOP}/admin/oauth/authorize?client_id=${CLIENT_ID}&scope=${SCOPES}&redirect_uri=${REDIRECT_URI}`;
+    res.redirect(url);
+});
+
+app.get("/auth/callback", async (req, res) => {
+    const { code } = req.query;
+    try {
+        const response = await fetch(`https://${SHOP}/admin/oauth/access_token`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ 
+                client_id: CLIENT_ID, 
+                client_secret: CLIENT_SECRET, 
+                code 
+            }),
+        });
+        const data = await response.json();
+        
+        if (data.access_token) {
+            saveToken(data.access_token, data.expires_in || 86400, data.refresh_token || null);
+            loadSyncState();
+            
+            const expiryDate = new Date(Date.now() + (data.expires_in || 86400) * 1000);
+            addLog(`✅ Token valid until: ${expiryDate.toLocaleString()}`, "success");
+            
+            // Register webhook after auth
+            registerWebhook();
+            
+            res.send(`
+                <!DOCTYPE html>
+                <html>
+                <head><title>Auth Success</title></head>
+                <body style="background:#0C0C0C; color:#00FF41; font-family: monospace; text-align: center; padding: 50px;">
+                    <h2>✅ AUTHENTICATION_SUCCESSFUL</h2>
+                    <p>Token saved. Expires: ${expiryDate.toLocaleString()}</p>
+                    <p>Redirecting to dashboard...</p>
+                    <script>setTimeout(() => { window.location.href = '/'; }, 2000);</script>
+                </body>
+                </html>
+            `);
+        } else {
+            res.status(400).send(`❌ Auth Failed: ${JSON.stringify(data)}`);
+        }
+    } catch (err) {
+        res.status(500).send(`❌ Auth Error: ${err.message}`);
+    }
+});
+
+// ================= AUTO-START AND SCHEDULE =================
+
+loadSyncState();
+
+setTimeout(async () => {
+    const isValid = await ensureValidToken();
+    if (isValid) {
+        addLog("🔐 TOKEN_VALID - Auto-starting sync in 5 seconds...", "info");
+        setTimeout(() => {
+            runSync().catch(console.error);
+        }, 5000);
+    } else {
+        addLog("🔑 NO_VALID_TOKEN - Visit /auth to authenticate", "warning");
+    }
+}, 2000);
+
+// Schedule sync every 6 hours
+cron.schedule("0 */6 * * *", async () => {
+    if (!isRunning) {
+        const isValid = await ensureValidToken();
+        if (isValid) {
+            addLog("\n🤖 Scheduled sync triggered (every 6 hours)...", "info");
+            runSync().catch(console.error);
+        }
+    }
+});
+
+// Check token expiry daily and auto-refresh
+cron.schedule("0 0 * * *", async () => {
+    if (tokenData.refresh_token && tokenData.expires_at) {
+        const daysUntilExpiry = (tokenData.expires_at - Date.now()) / (1000 * 60 * 60 * 24);
+        if (daysUntilExpiry < 2) {
+            addLog(`⚠️ Token expires in ${daysUntilExpiry.toFixed(1)} days. Attempting refresh...`, "warning");
+            await refreshAccessToken();
+        }
+    }
+});
+
 // ================= START SERVER =================
 
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`\n🔥 Optimized Server running on port ${PORT}`);
-  console.log("📋 Configuration:");
-  console.log(`   - Shopify: ${SHOP}`);
-  console.log(`   - B2B Catalogs: Silver, Gold, Platinum`);
-  console.log(`   - SKU Normalization: ON`);
-  console.log(`   - Change Detection: ON (with persistence)`);
-  console.log(`   - Cache File: ${CACHE_FILE}`);
-  console.log("\n🔄 Auto-sync every 30 minutes");
-  console.log(`📨 Webhook: POST to http://localhost:${PORT}/webhook`);
-  console.log(`🔧 Manual sync: POST to http://localhost:${PORT}/sync`);
-  console.log(`🔍 Debug: http://localhost:${PORT}/debug/status\n`);
-  
-  syncAll();
+    console.log("\n" + "=".repeat(60));
+    console.log("  ╔════════════════════════════════════════════════╗");
+    console.log("  ║     OMS TO SHOPIFY PRICE SYNC                  ║");
+    console.log("  ║     http://localhost:" + PORT + "                    ║");
+    console.log("  ╚════════════════════════════════════════════════╝");
+    console.log("=".repeat(60));
+    console.log("\n  ⚡ OPTIMIZATIONS:");
+    console.log("     30 concurrent requests");
+    console.log("     100 products per batch");
+    console.log("     10ms delay between batches");
+    console.log("\n  📊 FEATURES:");
+    console.log("     - Auto price sync every 6 hours");
+    console.log("     - New product detection");
+    console.log("     - Unmatched SKU tracking");
+    console.log("     - Token auto-refresh");
+    console.log("     - Real-time dashboard\n");
+    console.log("  Press Ctrl+C to stop the server.\n");
 });
-
-setInterval(syncAll, 30 * 60 * 1000);
