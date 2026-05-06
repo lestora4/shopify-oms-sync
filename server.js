@@ -481,7 +481,7 @@ async function getChangedOmsProducts() {
     }
 }
 
-// Sync only changed products (efficient - used by auto-polling)
+// Sync only price changes for products that ALREADY EXIST in Shopify
 async function syncChangedProducts() {
     if (isRunning) {
         addLog("⏭️ Sync already in progress, skipping auto-poll", "warning");
@@ -503,6 +503,7 @@ async function syncChangedProducts() {
     isRunning = true;
     let successCount = 0;
     let errorCount = 0;
+    let skippedCount = 0;
     
     try {
         for (const product of changedProducts) {
@@ -517,7 +518,7 @@ async function syncChangedProducts() {
                 continue;
             }
             
-            // Find Shopify variant
+            // Find Shopify variant (ONLY update if it EXISTS in Shopify)
             const query = `
                 query($sku: String!) {
                     productVariants(first: 1, query: $sku) {
@@ -534,9 +535,10 @@ async function syncChangedProducts() {
             const data = await shopifyGraphQL(query, { sku: `sku:'${sku}'` });
             const variant = data?.productVariants?.edges?.[0]?.node;
             
+            // IMPORTANT: If product NOT in Shopify, SKIP (don't create)
             if (!variant) {
-                addLog(`   ❌ ${sku} not found in Shopify`, "error");
-                errorCount++;
+                addLog(`   ⏭️ ${sku} not found in Shopify - SKIPPING (no auto-creation)`, "warning");
+                skippedCount++;
                 continue;
             }
             
@@ -552,7 +554,7 @@ async function syncChangedProducts() {
                 continue;
             }
             
-                        const updatePriceList = async (listId, price) => {
+            const updatePriceList = async (listId, price) => {
                 const mutation = `
                     mutation($id: ID!, $prices: [PriceListPriceInput!]!) {
                         priceListFixedPricesAdd(priceListId: $id, prices: $prices) {
@@ -577,6 +579,7 @@ async function syncChangedProducts() {
                 updatePriceList(GOLD_PRICE_LIST, omsPrices.gold),
                 updatePriceList(PLATINUM_PRICE_LIST, omsPrices.platinum)
             ]);
+            
             if (results.every(r => r === true)) {
                 addPriceChange(sku, variant.product?.title || sku, currentPrices, omsPrices);
                 addLog(`   ✅ Updated ${sku} - S:$${omsPrices.silver} G:$${omsPrices.gold} P:$${omsPrices.platinum}`, "success");
@@ -588,7 +591,7 @@ async function syncChangedProducts() {
         }
         
         saveLastPollTime();
-        addLog(`📊 Auto-poll results: ✅ ${successCount} updated, ❌ ${errorCount} failed`, "info");
+        addLog(`📊 Auto-poll results: ✅ ${successCount} updated, ❌ ${errorCount} failed, ⏭️ ${skippedCount} skipped (not in Shopify)`, "info");
         
     } catch (err) {
         addLog(`❌ Auto-poll sync failed: ${err.message}`, "error");
@@ -899,19 +902,7 @@ app.post("/webhooks/oms/price-change", async (req, res) => {
     res.status(200).send("OK");
 });
 
-// OMS New Product Webhook
-app.post("/webhooks/oms/product-create", async (req, res) => {
-    addLog(`🆕 INSTANT: New product created in OMS!`, "success");
-    const { item_num, sku } = req.body;
-    
-    const targetSku = sku || item_num;
-    if (targetSku) {
-        addLog(`   → Instantly syncing new product: ${targetSku}`, "info");
-        syncSingleSku(targetSku, "new OMS product").catch(console.error);
-    }
-    
-    res.status(200).send("OK");
-});
+
 
 // Single SKU sync function for instant updates
 async function syncSingleSku(sku, source = "webhook") {
@@ -1160,7 +1151,226 @@ async function getRecentOmsChanges() {
         return [];
     }
 }
+// ================= SHOPIFY WEBHOOKS FOR AUTO-SYNC =================
 
+// Shopify Product Create Webhook - Auto-sync when you add NEW product in Shopify
+app.post("/webhooks/shopify/product-create", async (req, res) => {
+    addLog(`🛍️ SHOPIFY: New product creation webhook received!`, "success");
+    
+    try {
+        const product = req.body;
+        const variant = product.variants?.[0];
+        const sku = variant?.sku;
+        
+        if (!sku) {
+            addLog(`   ⚠️ Product has no SKU, skipping auto-sync`, "warning");
+            return res.status(200).send("OK");
+        }
+        
+        addLog(`   → New product detected: ${sku} - ${product.title}`, "info");
+        
+        // Look up SKU in OMS
+        const omsPrices = await lookupSkuInOMS(sku);
+        
+        if (!omsPrices) {
+            addLog(`   ❌ SKU ${sku} not found in OMS - check OMS or add piece unit`, "warning");
+            addUnmatchedSku(sku, product.title, "Not found in OMS when product created in Shopify");
+            return res.status(200).send("OK");
+        }
+        
+        addLog(`   ✅ SKU found in OMS! Updating prices...`, "success");
+        addLog(`   📦 OMS Prices - Silver: $${omsPrices.silver}, Gold: $${omsPrices.gold}, Platinum: $${omsPrices.platinum}`, "info");
+        
+        // Find the variant ID in Shopify
+        const query = `
+            query($sku: String!) {
+                productVariants(first: 1, query: $sku) {
+                    edges {
+                        node {
+                            id
+                            product { title }
+                        }
+                    }
+                }
+            }
+        `;
+        
+        const data = await shopifyGraphQL(query, { sku: `sku:'${sku}'` });
+        const variantNode = data?.productVariants?.edges?.[0]?.node;
+        
+        if (!variantNode) {
+            addLog(`   ❌ Could not find variant for SKU ${sku} after creation`, "error");
+            return res.status(200).send("OK");
+        }
+        
+        // Update all three price lists
+        const updatePriceList = async (listId, price) => {
+            const mutation = `
+                mutation($id: ID!, $prices: [PriceListPriceInput!]!) {
+                    priceListFixedPricesAdd(priceListId: $id, prices: $prices) {
+                        userErrors { field message }
+                    }
+                }
+            `;
+            
+            const result = await shopifyGraphQL(mutation, {
+                id: listId,
+                prices: [{
+                    variantId: variantNode.id,
+                    price: { amount: String(price), currencyCode: "USD" }
+                }]
+            });
+            
+            if (result?.priceListFixedPricesAdd?.userErrors?.length) {
+                result.priceListFixedPricesAdd.userErrors.forEach(err => {
+                    addLog(`      Error: ${err.message}`, "error");
+                });
+                return false;
+            }
+            return true;
+        };
+        
+        const results = await Promise.all([
+            updatePriceList(SILVER_PRICE_LIST, omsPrices.silver),
+            updatePriceList(GOLD_PRICE_LIST, omsPrices.gold),
+            updatePriceList(PLATINUM_PRICE_LIST, omsPrices.platinum)
+        ]);
+        
+        if (results.every(r => r === true)) {
+            const currentPrices = { silver: 0, gold: 0, platinum: 0 };
+            addPriceChange(sku, variantNode.product?.title || sku, currentPrices, omsPrices, true);
+            addLog(`   ✅ AUTO-SYNC COMPLETE: ${sku} prices set from OMS`, "success");
+        } else {
+            addLog(`   ❌ Failed to update some price lists for ${sku}`, "error");
+        }
+        
+    } catch (err) {
+        addLog(`   ❌ Auto-sync failed: ${err.message}`, "error");
+    }
+    
+    res.status(200).send("OK");
+});
+
+// Shopify Product Update Webhook - Auto-sync when product is UPDATED in Shopify
+app.post("/webhooks/shopify/product-update", async (req, res) => {
+    addLog(`🛍️ SHOPIFY: Product update webhook received!`, "info");
+    
+    try {
+        const product = req.body;
+        const variant = product.variants?.[0];
+        const sku = variant?.sku;
+        
+        if (!sku) {
+            addLog(`   ⚠️ Updated product has no SKU, skipping sync`, "warning");
+            return res.status(200).send("OK");
+        }
+        
+        addLog(`   → Product updated: ${sku} - ${product.title}`, "info");
+        
+        // Look up SKU in OMS
+        const omsPrices = await lookupSkuInOMS(sku);
+        
+        if (!omsPrices) {
+            addLog(`   ⚠️ SKU ${sku} not found in OMS - check OMS`, "warning");
+            addUnmatchedSku(sku, product.title, "Updated in Shopify but not found in OMS");
+            return res.status(200).send("OK");
+        }
+        
+        // Get current Shopify prices
+        const query = `
+            query($sku: String!) {
+                productVariants(first: 1, query: $sku) {
+                    edges {
+                        node {
+                            id
+                            product { title }
+                        }
+                    }
+                }
+            }
+        `;
+        
+        const data = await shopifyGraphQL(query, { sku: `sku:'${sku}'` });
+        const variantNode = data?.productVariants?.edges?.[0]?.node;
+        
+        if (!variantNode) {
+            addLog(`   ❌ Could not find variant for SKU ${sku}`, "error");
+            return res.status(200).send("OK");
+        }
+        
+        // Get current prices from Shopify
+        const currentPrices = await getCurrentPriceListPrices(variantNode.id);
+        
+        // Check if update needed
+        const needsUpdate = 
+            currentPrices.silver !== omsPrices.silver ||
+            currentPrices.gold !== omsPrices.gold ||
+            currentPrices.platinum !== omsPrices.platinum;
+        
+        if (!needsUpdate) {
+            addLog(`   ✅ ${sku} prices already match OMS`, "success");
+            return res.status(200).send("OK");
+        }
+        
+        addLog(`   🔄 Prices differ from OMS - updating...`, "info");
+        addLog(`   Current: S$${currentPrices.silver} G$${currentPrices.gold} P$${currentPrices.platinum}`, "info");
+        addLog(`   OMS: S$${omsPrices.silver} G$${omsPrices.gold} P$${omsPrices.platinum}`, "info");
+        
+        // Update all three price lists
+        const updatePriceList = async (listId, price) => {
+            const mutation = `
+                mutation($id: ID!, $prices: [PriceListPriceInput!]!) {
+                    priceListFixedPricesAdd(priceListId: $id, prices: $prices) {
+                        userErrors { field message }
+                    }
+                }
+            `;
+            
+            const result = await shopifyGraphQL(mutation, {
+                id: listId,
+                prices: [{
+                    variantId: variantNode.id,
+                    price: { amount: String(price), currencyCode: "USD" }
+                }]
+            });
+            
+            if (result?.priceListFixedPricesAdd?.userErrors?.length) {
+                result.priceListFixedPricesAdd.userErrors.forEach(err => {
+                    addLog(`      Error: ${err.message}`, "error");
+                });
+                return false;
+            }
+            return true;
+        };
+        
+        const results = await Promise.all([
+            updatePriceList(SILVER_PRICE_LIST, omsPrices.silver),
+            updatePriceList(GOLD_PRICE_LIST, omsPrices.gold),
+            updatePriceList(PLATINUM_PRICE_LIST, omsPrices.platinum)
+        ]);
+        
+        if (results.every(r => r === true)) {
+            addPriceChange(sku, variantNode.product?.title || sku, currentPrices, omsPrices, false);
+            addLog(`   ✅ AUTO-SYNC COMPLETE: ${sku} prices updated from OMS`, "success");
+        } else {
+            addLog(`   ❌ Failed to update some price lists for ${sku}`, "error");
+        }
+        
+    } catch (err) {
+        addLog(`   ❌ Auto-sync failed: ${err.message}`, "error");
+    }
+    
+    res.status(200).send("OK");
+});
+
+// Optional: Shopify Product Delete Webhook - Track deleted products
+app.post("/webhooks/shopify/product-delete", async (req, res) => {
+    addLog(`🛍️ SHOPIFY: Product deleted webhook received`, "warning");
+    const { id } = req.body;
+    addLog(`   → Product ID: ${id} was deleted`, "warning");
+    // You can add logic here to track deletions if needed
+    res.status(200).send("OK");
+});
 // ================= API ENDPOINTS =================
 
 app.get("/unmatched-skus", (req, res) => {
