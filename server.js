@@ -481,134 +481,17 @@ async function getChangedOmsProducts() {
     }
 }
 
-// Sync only price changes for products that ALREADY EXIST in Shopify
-async function syncChangedProducts() {
-    if (isRunning) {
-        addLog("⏭️ Sync already in progress, skipping auto-poll", "warning");
-        return;
-    }
-    
-    addLog("🔍 Auto-poll: Checking for changed OMS products...", "info");
-    
-    const changedProducts = await getChangedOmsProducts();
-    
-    if (changedProducts.length === 0) {
-        addLog("✅ No changed products found", "success");
-        saveLastPollTime();
-        return;
-    }
-    
-    addLog(`📦 Found ${changedProducts.length} changed product(s) in OMS`, "success");
-    
-    isRunning = true;
-    let successCount = 0;
-    let errorCount = 0;
-    let skippedCount = 0;
-    
-    try {
-        for (const product of changedProducts) {
-            const sku = product.item_num;
-            addLog(`🔄 Processing changed product: ${sku}`, "info");
-            
-            // Get OMS prices
-            const omsPrices = await lookupSkuInOMS(sku);
-            if (!omsPrices) {
-                addLog(`   ❌ ${sku} not found in OMS variants`, "error");
-                errorCount++;
-                continue;
-            }
-            
-            // Find Shopify variant (ONLY update if it EXISTS in Shopify)
-            const query = `
-                query($sku: String!) {
-                    productVariants(first: 1, query: $sku) {
-                        edges {
-                            node {
-                                id
-                                product { title }
-                            }
-                        }
-                    }
-                }
-            `;
-            
-            const data = await shopifyGraphQL(query, { sku: `sku:'${sku}'` });
-            const variant = data?.productVariants?.edges?.[0]?.node;
-            
-            // IMPORTANT: If product NOT in Shopify, SKIP (don't create)
-            if (!variant) {
-                addLog(`   ⏭️ ${sku} not found in Shopify - SKIPPING (no auto-creation)`, "warning");
-                skippedCount++;
-                continue;
-            }
-            
-            // Get current prices
-            const currentPrices = await getCurrentPriceListPrices(variant.id);
-            
-            // Check if update needed
-            if (currentPrices.silver === omsPrices.silver && 
-                currentPrices.gold === omsPrices.gold && 
-                currentPrices.platinum === omsPrices.platinum) {
-                addLog(`   ✅ ${sku} prices already match`, "success");
-                successCount++;
-                continue;
-            }
-            
-            const updatePriceList = async (listId, price) => {
-                const mutation = `
-                    mutation($id: ID!, $prices: [PriceListPriceInput!]!) {
-                        priceListFixedPricesAdd(priceListId: $id, prices: $prices) {
-                            userErrors { field message }
-                        }
-                    }
-                `;
-                
-                const result = await shopifyGraphQL(mutation, {
-                    id: listId,
-                    prices: [{
-                        variantId: variant.id,
-                        price: { amount: String(price), currencyCode: "USD" }
-                    }]
-                });
-                
-                return !result?.priceListFixedPricesAdd?.userErrors?.length;
-            };
-            
-            const results = await Promise.all([
-                updatePriceList(SILVER_PRICE_LIST, omsPrices.silver),
-                updatePriceList(GOLD_PRICE_LIST, omsPrices.gold),
-                updatePriceList(PLATINUM_PRICE_LIST, omsPrices.platinum)
-            ]);
-            
-            if (results.every(r => r === true)) {
-                addPriceChange(sku, variant.product?.title || sku, currentPrices, omsPrices);
-                addLog(`   ✅ Updated ${sku} - S:$${omsPrices.silver} G:$${omsPrices.gold} P:$${omsPrices.platinum}`, "success");
-                successCount++;
-            } else {
-                addLog(`   ❌ Failed to update ${sku}`, "error");
-                errorCount++;
-            }
-        }
-        
-        saveLastPollTime();
-        addLog(`📊 Auto-poll results: ✅ ${successCount} updated, ❌ ${errorCount} failed, ⏭️ ${skippedCount} skipped (not in Shopify)`, "info");
-        
-    } catch (err) {
-        addLog(`❌ Auto-poll sync failed: ${err.message}`, "error");
-    } finally {
-        isRunning = false;
-    }
-}
 
 // Start efficient auto-polling (every 2 minutes - only changed products)
 function startEfficientPolling() {
     loadLastPollTime();
     
     setInterval(async () => {
-        if (!isRunning) {
-            await syncChangedProducts();
-        }
-    }, 120000); // 2 minutes
+    if (!isRunning) {
+        addLog("🔄 Auto-poll: Running full comparison sync...", "info");
+        await runSync(); // ✅ THIS IS THE FIX - compares all prices
+    }
+}, 120000); // 2 minutes
     
     addLog("🔔 Started efficient OMS polling (every 2 minutes)", "success");
     addLog("   📅 Only fetches products changed since last poll", "info");
@@ -1414,8 +1297,8 @@ app.post("/incremental-sync", async (req, res) => {
         return res.json({ success: false, error: "Sync already in progress" });
     }
     
-    addLog("⚡ INCREMENTAL SYNC MODE - Will only sync changed products", "info");
-    syncChangedProducts().catch(console.error);
+    addLog("⚡ INCREMENTAL SYNC MODE - Running full comparison sync", "info");
+    runSync().catch(console.error);  // ✅ Use runSync instead
     res.json({ success: true, message: "Incremental sync started" });
 });
 
