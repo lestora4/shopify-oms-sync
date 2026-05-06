@@ -1035,7 +1035,12 @@ async function getRecentOmsChanges() {
     }
 }
 // ================= SHOPIFY WEBHOOKS FOR AUTO-SYNC =================
+app.post("/webhooks/shopify/product-create", async (req, res) => {
+    console.log("🔥 WEBHOOK HIT (RENDER)");
+    console.log(JSON.stringify(req.body, null, 2));
 
+    res.status(200).send("OK");
+});
 // Shopify Product Create Webhook - Auto-sync when you add NEW product in Shopify
 app.post("/webhooks/shopify/product-create", async (req, res) => {
     addLog(`🛍️ SHOPIFY: New product creation webhook received!`, "success");
