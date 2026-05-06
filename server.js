@@ -138,24 +138,8 @@ function saveToken(accessToken, expiresIn = null, refreshToken = null) {
 }
 
 function getToken() {
-    if (!fs.existsSync(TOKEN_FILE)) return null;
-    
-    try {
-        const saved = JSON.parse(fs.readFileSync(TOKEN_FILE, 'utf8'));
-        tokenData = saved;
-        
-        // Check if token is expired
-        if (tokenData.expires_at && Date.now() >= tokenData.expires_at) {
-            addLog("⚠️ Token expired! Please re-authenticate.", "warning");
-            return null;
-        }
-        
-        return tokenData.access_token;
-    } catch (err) {
-        return null;
-    }
+    return process.env.SHOPIFY_ACCESS_TOKEN || null;
 }
-
 async function refreshAccessToken() {
     if (!tokenData.refresh_token) {
         addLog("⚠️ No refresh token available. Please re-authenticate.", "warning");
@@ -1650,7 +1634,10 @@ app.get("/auth/callback", async (req, res) => {
         const data = await response.json();
         
         if (data.access_token) {
-            saveToken(data.access_token, data.expires_in || 86400, data.refresh_token || null);
+            console.log("====================================");
+console.log("COPY THIS TOKEN:");
+console.log(data.access_token);
+console.log("====================================");
             loadSyncState();
             
             const expiryDate = new Date(Date.now() + (data.expires_in || 86400) * 1000);
