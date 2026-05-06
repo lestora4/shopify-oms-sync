@@ -1571,15 +1571,16 @@ async function startFullSync() {
                     }
                 }
                 
-                async function clearAll() {
-                    await fetch('/clear-logs', { method: 'POST' });
-                    await fetch('/clear-changes', { method: 'POST' });
-                    document.getElementById('logs').innerHTML = '<div class="log-entry"><span class="log-info">> LOGS_CLEARED</span></div>';
-                    loadPriceChanges();
-                    loadUnmatched();
-                    addLog('ALL_HISTORY_CLEARED', 'warning');
-                }
-                
+               async function clearAll() {
+    // Just clear the dashboard displays locally
+    document.getElementById('logs').innerHTML = '<div class="log-entry"><span class="log-info">> LOGS_CLEARED</span></div>';
+    document.getElementById('changes').innerHTML = '<div class="change-entry"><span class="log-info">No changes yet</span></div>';
+    document.getElementById('unmatched').innerHTML = '<div class="unmatched-entry"><span class="log-info">No unmatched SKUs</span></div>';
+    
+    // Also clear the local arrays in memory (frontend only)
+    // No fetch calls to backend needed
+    console.log('Dashboard cleared');
+}
                 async function refreshHealth() {
                     const response = await fetch('/health');
                     const health = await response.json();
