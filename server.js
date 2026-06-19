@@ -466,7 +466,7 @@ async function getChangedOmsProducts() {
 }
 
 
-// Start efficient auto-polling (every 2 minutes - only changed products)
+// Start efficient auto-polling (every 2 hour - only changed products)
 function startEfficientPolling() {
     loadLastPollTime();
     
@@ -475,9 +475,9 @@ function startEfficientPolling() {
         addLog("🔄 Auto-poll: Running full comparison sync...", "info");
         await runSync(); // ✅ THIS IS THE FIX - compares all prices
     }
-}, 3600000); // 1 hour
+}, 7200000); // 2 hours 
     
-    addLog("🔔 Started efficient OMS polling (every 2 minutes)", "success");
+    addLog("🔔 Started efficient OMS polling (every 2 hour)", "success");
     addLog("   📅 Only fetches products changed since last poll", "info");
 }
 // ================= MAIN SYNC FUNCTION =================
