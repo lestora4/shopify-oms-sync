@@ -1635,6 +1635,10 @@ app.get("/auth/callback", async (req, res) => {
             }),
         });
         const data = await response.json();
+        console.log("FULL SHOPIFY RESPONSE:");
+console.log(JSON.stringify(data, null, 2));
+console.log("expires_in:", data.expires_in);
+console.log("refresh_token:", data.refresh_token);
         
         if (data.access_token) {
             console.log("====================================");
