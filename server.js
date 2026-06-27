@@ -161,6 +161,8 @@ async function refreshAccessToken() {
         });
         
         const data = await response.json();
+        console.log("FULL SHOPIFY RESPONSE:");
+console.log(JSON.stringify(data, null, 2));
         
         if (data.access_token) {
             saveToken(data.access_token, data.expires_in, data.refresh_token);
