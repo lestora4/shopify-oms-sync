@@ -96,7 +96,7 @@ function getPrice(prices, type) {
     return found ? Number(found.value) : 0;
 }
 
-// ================= FIXED lookupSkuInOMS (ONLY ONE VERSION) =================
+// ================= FIXED lookupSkuInOMS =================
 
 async function lookupSkuInOMS(sku) {
     if (!sku) return null;
@@ -431,6 +431,124 @@ function startEfficientPolling() {
     addLog("🔔 Started efficient OMS polling (every 2 hours)", "success");
 }
 
+// ================= MANUAL PRICE CHANGE DETECTION =================
+
+let knownPrices = new Map();
+
+function loadKnownPrices() {
+    const file = "./known_prices.json";
+    if (fs.existsSync(file)) {
+        try {
+            const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+            knownPrices = new Map(Object.entries(data));
+            addLog(`📁 Loaded ${knownPrices.size} known SKU prices`, "info");
+        } catch (err) {}
+    }
+}
+
+function saveKnownPrices() {
+    const file = "./known_prices.json";
+    const obj = Object.fromEntries(knownPrices);
+    fs.writeFileSync(file, JSON.stringify(obj, null, 2));
+}
+
+async function detectManualPriceChanges() {
+    addLog("🔍 Scanning for manual price changes in Shopify...", "info");
+    
+    try {
+        const shopifyVariants = await getAllShopifyVariants();
+        let manualChangesDetected = 0;
+        let checked = 0;
+        
+        for (const variant of shopifyVariants) {
+            const sku = variant.sku;
+            if (!sku) continue;
+            
+            checked++;
+            if (checked % 10 === 0) {
+                addLog(`   Progress: ${checked}/${Math.min(shopifyVariants.length, 50)}`, "info");
+            }
+            
+            const currentPrices = await getCurrentPriceListPrices(variant.id);
+            const omsPrices = await lookupSkuInOMS(sku);
+            if (!omsPrices) continue;
+            
+            const matchesOMS = 
+                currentPrices.silver === omsPrices.silver &&
+                currentPrices.gold === omsPrices.gold &&
+                currentPrices.platinum === omsPrices.platinum;
+            
+            if (!matchesOMS) {
+                addLog(`⚠️ MANUAL PRICE CHANGE DETECTED for ${sku}`, "warning");
+                addLog(`   Current: S$${currentPrices.silver} G$${currentPrices.gold} P$${currentPrices.platinum}`, "warning");
+                addLog(`   OMS: S$${omsPrices.silver} G$${omsPrices.gold} P$${omsPrices.platinum}`, "info");
+                addLog(`   🔄 Force reverting to OMS prices...`, "info");
+                
+                const updatePriceList = async (listId, price) => {
+                    const mutation = `
+                        mutation($id: ID!, $prices: [PriceListPriceInput!]!) {
+                            priceListFixedPricesAdd(priceListId: $id, prices: $prices) {
+                                userErrors { field message }
+                            }
+                        }
+                    `;
+                    
+                    const result = await shopifyGraphQL(mutation, {
+                        id: listId,
+                        prices: [{
+                            variantId: variant.id,
+                            price: { amount: String(price), currencyCode: "USD" }
+                        }]
+                    });
+                    
+                    return !result?.priceListFixedPricesAdd?.userErrors?.length;
+                };
+                
+                const results = await Promise.all([
+                    updatePriceList(SILVER_PRICE_LIST, omsPrices.silver),
+                    updatePriceList(GOLD_PRICE_LIST, omsPrices.gold),
+                    updatePriceList(PLATINUM_PRICE_LIST, omsPrices.platinum)
+                ]);
+                
+                if (results.every(r => r === true)) {
+                    addLog(`   ✅ Force reverted ${sku} back to OMS prices`, "success");
+                    manualChangesDetected++;
+                    addPriceChange(sku, variant.title || sku, currentPrices, omsPrices, false);
+                } else {
+                    addLog(`   ❌ Failed to revert ${sku}`, "error");
+                }
+                
+                await new Promise(r => setTimeout(r, 200));
+            }
+        }
+        
+        if (manualChangesDetected > 0) {
+            addLog(`📊 Detected and reverted ${manualChangesDetected} manual price change(s)`, "success");
+        } else {
+            addLog("✅ No manual price changes detected", "success");
+        }
+        
+        saveKnownPrices();
+        
+    } catch (err) {
+        addLog(`❌ Manual price detection failed: ${err.message}`, "error");
+    }
+}
+
+// ================= START MANUAL PRICE MONITORING =================
+
+function startManualPriceMonitoring() {
+    loadKnownPrices();
+    
+    setInterval(async () => {
+        if (!isRunning) {
+            await detectManualPriceChanges();
+        }
+    }, 300000); // 5 minutes
+    
+    addLog("🔔 Started manual price change monitoring (every 5 minutes)", "success");
+}
+
 // ================= MAIN SYNC FUNCTION =================
 
 async function runSync() {
@@ -660,8 +778,539 @@ async function runSync() {
     }
 }
 
-// ================= WEBHOOKS AND OTHER ENDPOINTS =================
-// ... (keep all your existing webhook and endpoint code here)
+// ================= WEBHOOKS =================
+
+app.post("/webhook/product-update", async (req, res) => {
+    addLog(`🔔 Product update webhook received!`, "info");
+    res.status(200).send("OK");
+});
+
+app.post("/webhook/product-create", async (req, res) => {
+    addLog(`🆕 New product creation webhook received!`, "success");
+    if (!isRunning) {
+        addLog("🔄 Triggering sync for new product...", "info");
+        runSync().catch(console.error);
+    }
+    res.status(200).send("OK");
+});
+
+app.post("/webhooks/oms/product-update", async (req, res) => {
+    addLog(`⚡ INSTANT: OMS product update webhook received!`, "success");
+    const { item_num, sku } = req.body;
+    const targetSku = sku || item_num;
+    if (targetSku) {
+        addLog(`   → Instantly syncing SKU: ${targetSku}`, "info");
+        syncSingleSku(targetSku, "OMS webhook").catch(console.error);
+    }
+    res.status(200).send("OK");
+});
+
+app.post("/webhooks/oms/price-change", async (req, res) => {
+    addLog(`💰 INSTANT: OMS price change webhook received!`, "success");
+    const { item_num, sku } = req.body;
+    const targetSku = sku || item_num;
+    if (targetSku) {
+        addLog(`   → Instantly updating price for: ${targetSku}`, "info");
+        syncSingleSku(targetSku, "OMS price change").catch(console.error);
+    }
+    res.status(200).send("OK");
+});
+
+// ================= SINGLE SKU SYNC =================
+
+async function syncSingleSku(sku, source = "webhook") {
+    if (isRunning) {
+        addLog(`⏭️ Deferring ${sku} - full sync in progress`, "warning");
+        return;
+    }
+    
+    addLog(`⚡ INSTANT SYNC: ${sku} from ${source}`, "info");
+    
+    try {
+        const query = `
+            query($sku: String!) {
+                productVariants(first: 1, query: $sku) {
+                    edges {
+                        node {
+                            id
+                            product { title }
+                        }
+                    }
+                }
+            }
+        `;
+        
+        const data = await shopifyGraphQL(query, { sku: `sku:'${sku}'` });
+        const variant = data?.productVariants?.edges?.[0]?.node;
+        
+        if (!variant) {
+            addLog(`❌ SKU ${sku} not found in Shopify`, "error");
+            return;
+        }
+        
+        const omsPrices = await lookupSkuInOMS(sku);
+        if (!omsPrices) {
+            addLog(`❌ SKU ${sku} not found in OMS`, "error");
+            return;
+        }
+        
+        const currentPrices = await getCurrentPriceListPrices(variant.id);
+        
+        if (currentPrices.silver === omsPrices.silver && 
+            currentPrices.gold === omsPrices.gold && 
+            currentPrices.platinum === omsPrices.platinum) {
+            addLog(`✅ SKU ${sku} prices already match OMS`, "success");
+            return;
+        }
+        
+        const updatePriceList = async (listId, price) => {
+            const mutation = `
+                mutation($id: ID!, $prices: [PriceListPriceInput!]!) {
+                    priceListFixedPricesAdd(priceListId: $id, prices: $prices) {
+                        userErrors { field message }
+                    }
+                }
+            `;
+            
+            const result = await shopifyGraphQL(mutation, {
+                id: listId,
+                prices: [{
+                    variantId: variant.id,
+                    price: { amount: String(price), currencyCode: "USD" }
+                }]
+            });
+            
+            if (result?.priceListFixedPricesAdd?.userErrors?.length) {
+                return false;
+            }
+            return true;
+        };
+        
+        const results = await Promise.all([
+            updatePriceList(SILVER_PRICE_LIST, omsPrices.silver),
+            updatePriceList(GOLD_PRICE_LIST, omsPrices.gold),
+            updatePriceList(PLATINUM_PRICE_LIST, omsPrices.platinum)
+        ]);
+        
+        if (results.every(r => r === true)) {
+            addPriceChange(sku, variant.product?.title || sku, currentPrices, omsPrices);
+            addLog(`✅ INSTANT SYNC COMPLETE: ${sku} updated`, "success");
+        } else {
+            addLog(`❌ Failed to update ${sku}`, "error");
+        }
+        
+    } catch (err) {
+        addLog(`❌ Instant sync failed for ${sku}: ${err.message}`, "error");
+    }
+}
+
+// ================= API ENDPOINTS =================
+
+app.get("/unmatched-skus", (req, res) => {
+    res.json(unmatchedSkus.slice(0, 200));
+});
+
+app.get("/price-changes", (req, res) => {
+    res.json(priceChanges.slice(0, 200));
+});
+
+app.post("/sync", async (req, res) => {
+    if (isRunning) {
+        return res.json({ success: false, error: "Sync already in progress" });
+    }
+    runSync().catch(console.error);
+    res.json({ success: true, message: "Sync started" });
+});
+
+app.post("/full-sync", async (req, res) => {
+    if (isRunning) {
+        return res.json({ success: false, error: "Sync already in progress" });
+    }
+    
+    addLog("📦 FULL SYNC MODE - Will sync all products regardless of previous sync", "warning");
+    
+    const originalCount = lastSyncState.syncedSkus.length;
+    lastSyncState.syncedSkus = [];
+    saveSyncState();
+    addLog(`📋 Cleared sync history (was ${originalCount} SKUs) - will sync ALL products`, "info");
+    
+    runSync().catch(console.error);
+    
+    res.json({ success: true, message: "Full sync started" });
+});
+
+app.post("/incremental-sync", async (req, res) => {
+    if (isRunning) {
+        return res.json({ success: false, error: "Sync already in progress" });
+    }
+    
+    addLog("⚡ INCREMENTAL SYNC MODE - Running full comparison sync", "info");
+    runSync().catch(console.error);
+    res.json({ success: true, message: "Incremental sync started" });
+});
+
+app.get("/sync-stream", (req, res) => {
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    
+    const sendStats = () => {
+        const stats = {
+            matched: currentSync?.matched || lastSyncState.syncedSkus.length || 0,
+            updated: currentSync?.updated || 0,
+            errors: currentSync?.errors || 0,
+            newProducts: currentSync?.newProducts || 0,
+            unmatched: currentSync?.unmatched || 0,
+            status: isRunning ? "running" : (currentSync?.status || "idle"),
+            lastSyncTime: lastSyncState.lastSyncTime
+        };
+        res.write(`data: ${JSON.stringify({ type: 'stats', stats })}\n\n`);
+    };
+    
+    const interval = setInterval(sendStats, 2000);
+    req.on('close', () => clearInterval(interval));
+});
+
+app.get("/sync-status", (req, res) => {
+    res.json({
+        matched: currentSync?.matched || lastSyncState.syncedSkus.length || 0,
+        updated: currentSync?.updated || 0,
+        errors: currentSync?.errors || 0,
+        newProducts: currentSync?.newProducts || 0,
+        unmatched: currentSync?.unmatched || 0,
+        status: isRunning ? "running" : (currentSync?.status || "idle"),
+        lastSyncTime: lastSyncState.lastSyncTime
+    });
+});
+
+// ================= HEALTH CHECK =================
+
+app.get("/health", (req, res) => {
+    const uptime = process.uptime();
+    const uptimeHours = Math.floor(uptime / 3600);
+    const uptimeMinutes = Math.floor((uptime % 3600) / 60);
+    const uptimeSeconds = Math.floor(uptime % 60);
+    
+    res.json({
+        status: "healthy",
+        timestamp: new Date().toISOString(),
+        uptime: `${uptimeHours}h ${uptimeMinutes}m ${uptimeSeconds}s`,
+        sync: {
+            isRunning: isRunning,
+            lastSync: lastSyncState.lastSyncTime,
+            lastSyncStats: currentSync ? {
+                matched: currentSync.matched,
+                updated: currentSync.updated,
+                errors: currentSync.errors,
+                newProducts: currentSync.newProducts,
+                unmatched: currentSync.unmatched
+            } : null
+        },
+        shopify: { authenticated: !!getToken(), shop: SHOP },
+        oms: { apiConfigured: !!OMS_API_KEY },
+        syncState: {
+            productsSynced: lastSyncState.syncedSkus.length,
+            lastSyncTime: lastSyncState.lastSyncTime
+        }
+    });
+});
+
+// ================= FRONTEND DASHBOARD =================
+
+app.get("/", (req, res) => {
+    res.send(`
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>OMS → Shopify Price Sync</title>
+            <style>
+                * { margin: 0; padding: 0; box-sizing: border-box; }
+                body { background: #0C0C0C; font-family: 'Consolas', monospace; padding: 20px; color: #00FF41; }
+                .terminal { max-width: 1600px; margin: 0 auto; background: #0C0C0C; border: 1px solid #00FF41; border-radius: 8px; overflow: hidden; }
+                .terminal-header { background: #1a1a1a; padding: 12px 20px; border-bottom: 1px solid #00FF41; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 10px; }
+                .terminal-title { color: #00FF41; font-size: 14px; font-weight: bold; }
+                .terminal-title::before { content: "> "; }
+                .button-group { display: flex; gap: 10px; flex-wrap: wrap; }
+                .cmd-btn { background: transparent; border: 1px solid #00FF41; color: #00FF41; padding: 6px 15px; font-family: monospace; font-size: 12px; cursor: pointer; transition: all 0.2s; }
+                .cmd-btn:hover { background: #00FF41; color: #0C0C0C; }
+                .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 1px; background: #1a1a1a; border-bottom: 1px solid #00FF41; }
+                .stat-card { background: #0C0C0C; padding: 15px; text-align: center; }
+                .stat-value { font-size: 28px; font-weight: bold; color: #00FF41; }
+                .stat-label { font-size: 10px; color: #00AA33; margin-top: 5px; text-transform: uppercase; }
+                .panels { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; background: #1a1a1a; }
+                .panel { background: #0C0C0C; min-height: 400px; display: flex; flex-direction: column; }
+                .panel-header { background: #1a1a1a; padding: 10px 15px; border-bottom: 1px solid #00FF41; font-size: 12px; font-weight: bold; }
+                .logs-container, .changes-container, .unmatched-container { flex: 1; overflow-y: auto; padding: 10px; font-size: 11px; max-height: 500px; }
+                .log-entry { padding: 4px 0; border-bottom: 1px solid #1a3a1a; font-family: monospace; }
+                .log-info { color: #00AAFF; }
+                .log-success { color: #00FF41; }
+                .log-warning { color: #FFAA00; }
+                .log-error { color: #FF4444; }
+                .change-entry, .unmatched-entry { padding: 8px; border-bottom: 1px solid #1a3a1a; }
+                .change-sku, .unmatched-sku { color: #00FF41; font-weight: bold; }
+                .price-change { margin-top: 5px; padding-left: 10px; color: #00FF41; }
+                .badge-new { background: #00FF41; color: #0C0C0C; padding: 2px 6px; border-radius: 4px; font-size: 9px; margin-left: 5px; }
+                .health-check { background: #1a1a1a; padding: 10px 15px; border-top: 1px solid #00FF41; font-size: 11px; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 10px; }
+                @media (max-width: 1024px) { .panels { grid-template-columns: 1fr; } }
+                ::-webkit-scrollbar { width: 8px; }
+                ::-webkit-scrollbar-track { background: #1a1a1a; }
+                ::-webkit-scrollbar-thumb { background: #00FF41; border-radius: 4px; }
+            </style>
+        </head>
+        <body>
+            <div class="terminal">
+                <div class="terminal-header">
+                    <div class="terminal-title">OMS SYNC [READY]</div>
+                    <div class="button-group">
+                        <button class="cmd-btn" onclick="startFullSync()" style="background:#00AA33; color:#0C0C0C;">🔄 FULL SYNC</button>
+                        <button class="cmd-btn" onclick="startSync()">⚡ INCREMENTAL SYNC</button>
+                        <button class="cmd-btn" onclick="checkManualPrices()">🔍 CHECK MANUAL PRICES</button>
+                        <button class="cmd-btn" onclick="window.location.href='/auth'">🔑 AUTH</button>
+                        <button class="cmd-btn" onclick="clearAll()">🗑 CLEAR ALL</button>
+                        <button class="cmd-btn" onclick="refreshHealth()">🔄 HEALTH</button>
+                    </div>
+                </div>
+                
+                <div class="stats-grid">
+                    <div class="stat-card"><div class="stat-value" id="syncedCount">0</div><div class="stat-label">SYNCED SKUs</div></div>
+                    <div class="stat-card"><div class="stat-value" id="updatedCount">0</div><div class="stat-label">UPDATED</div></div>
+                    <div class="stat-card"><div class="stat-value" id="newCount">0</div><div class="stat-label">NEW PRODUCTS</div></div>
+                    <div class="stat-card"><div class="stat-value" id="unmatchedCount">0</div><div class="stat-label">UNMATCHED</div></div>
+                    <div class="stat-card"><div class="stat-value" id="errorCount">0</div><div class="stat-label">ERRORS</div></div>
+                </div>
+                
+                <div class="panels">
+                    <div class="panel">
+                        <div class="panel-header">📋 SYNC_LOGS</div>
+                        <div class="logs-container" id="logs">
+                            <div class="log-entry"><span class="log-info">> OMS SYNC READY</span></div>
+                            <div class="log-entry"><span class="log-info">> 30 concurrent requests | 100 products/batch</span></div>
+                        </div>
+                    </div>
+                    <div class="panel">
+                        <div class="panel-header">💰 PRICE CHANGES & NEW PRODUCTS</div>
+                        <div class="changes-container" id="changes">
+                            <div class="change-entry"><span class="log-info">No changes yet</span></div>
+                        </div>
+                    </div>
+                    <div class="panel">
+                        <div class="panel-header">❌ UNMATCHED SKUs</div>
+                        <div class="unmatched-container" id="unmatched">
+                            <div class="unmatched-entry"><span class="log-info">No unmatched SKUs</span></div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="health-check">
+                    <span id="healthStatus">🟢 HEALTH: OK</span>
+                    <span id="uptime">UPTIME: 0s</span>
+                    <span id="syncStatus">SYNC: IDLE</span>
+                    <span id="lastSync">LAST SYNC: NEVER</span>
+                </div>
+            </div>
+            
+            <script>
+                let eventSource;
+                
+                function connectSSE() {
+                    if (eventSource) eventSource.close();
+                    eventSource = new EventSource('/sync-stream');
+                    eventSource.onmessage = (event) => {
+                        const data = JSON.parse(event.data);
+                        if (data.type === 'log') addLog(data.message, data.level);
+                        else if (data.type === 'stats') updateStats(data.stats);
+                    };
+                }
+                
+                function addLog(message, level) {
+                    const logsDiv = document.getElementById('logs');
+                    const timestamp = new Date().toLocaleTimeString();
+                    const logDiv = document.createElement('div');
+                    logDiv.className = 'log-entry';
+                    logDiv.innerHTML = \`[\${timestamp}] <span class="log-\${level}">\${message}</span>\`;
+                    logsDiv.insertBefore(logDiv, logsDiv.firstChild);
+                    if (logsDiv.children.length > 200) logsDiv.removeChild(logsDiv.lastChild);
+                }
+                
+                function updateStats(stats) {
+                    document.getElementById('syncedCount').textContent = stats.matched || 0;
+                    document.getElementById('updatedCount').textContent = stats.updated || 0;
+                    document.getElementById('newCount').textContent = stats.newProducts || 0;
+                    document.getElementById('unmatchedCount').textContent = stats.unmatched || 0;
+                    document.getElementById('errorCount').textContent = stats.errors || 0;
+                    document.getElementById('syncStatus').innerHTML = stats.status === 'running' ? 'SYNC: 🟢 RUNNING' : 'SYNC: ⚫ IDLE';
+                    if (stats.lastSyncTime) document.getElementById('lastSync').innerHTML = 'LAST SYNC: ' + new Date(stats.lastSyncTime).toLocaleTimeString();
+                    
+                    if (stats.status === 'running') {
+                        document.querySelector('.terminal-title').innerHTML = '> OMS SYNC [RUNNING]';
+                    } else {
+                        document.querySelector('.terminal-title').innerHTML = '> OMS SYNC [READY]';
+                    }
+                }
+                
+                async function startSync() {
+                    addLog('⚡ INCREMENTAL_SYNC_TRIGGERED', 'info');
+                    const response = await fetch('/incremental-sync', { method: 'POST' });
+                    const data = await response.json();
+                    if (data.success) {
+                        addLog('INCREMENTAL_SYNC_STARTED - Syncing changed products only', 'success');
+                    } else {
+                        addLog('SYNC_FAILED: ' + data.error, 'error');
+                    }
+                }
+
+                async function startFullSync() {
+                    addLog('🔄 FULL_SYNC_TRIGGERED - This will sync ALL products', 'warning');
+                    addLog('⚠️ This may take 5-10 minutes for 2000+ products', 'warning');
+                    const response = await fetch('/full-sync', { method: 'POST' });
+                    const data = await response.json();
+                    if (data.success) {
+                        addLog('FULL_SYNC_STARTED - Syncing all products...', 'success');
+                        setTimeout(() => fetchStats(), 1000);
+                    } else {
+                        addLog('FULL_SYNC_FAILED: ' + data.error, 'error');
+                    }
+                }
+                
+                async function checkManualPrices() {
+                    addLog('🔍 CHECKING FOR MANUAL PRICE CHANGES...', 'info');
+                    const response = await fetch('/check-manual-prices', { method: 'POST' });
+                    const data = await response.json();
+                    if (data.success) {
+                        addLog('✅ Manual price check completed. Any changes will be reverted.', 'success');
+                    } else {
+                        addLog('❌ Check failed: ' + data.error, 'error');
+                    }
+                }
+                
+                async function loadPriceChanges() {
+                    const response = await fetch('/price-changes');
+                    const changes = await response.json();
+                    const changesDiv = document.getElementById('changes');
+                    changesDiv.innerHTML = '';
+                    if (changes.length === 0) {
+                        changesDiv.innerHTML = '<div class="change-entry"><span class="log-info">No changes yet</span></div>';
+                    } else {
+                        changes.slice(0, 50).forEach(change => {
+                            const div = document.createElement('div');
+                            div.className = 'change-entry';
+                            div.innerHTML = \`
+                                <div class="change-sku">📦 \${change.sku} \${change.isNew ? '<span class="badge-new">NEW</span>' : ''}</div>
+                                <div class="change-title">\${change.title || change.sku}</div>
+                                <div class="price-change">💰 Silver: $\${change.newPrices.silver} (was $\${change.oldPrices.silver})</div>
+                                <div class="price-change">🥇 Gold: $\${change.newPrices.gold} (was $\${change.oldPrices.gold})</div>
+                                <div class="price-change">💎 Platinum: $\${change.newPrices.platinum} (was $\${change.oldPrices.platinum})</div>
+                                <div style="color:#555;font-size:9px; margin-top: 5px;">\${new Date(change.timestamp).toLocaleString()}</div>
+                            \`;
+                            changesDiv.appendChild(div);
+                        });
+                    }
+                }
+                
+                async function loadUnmatched() {
+                    const response = await fetch('/unmatched-skus');
+                    const unmatched = await response.json();
+                    const unmatchedDiv = document.getElementById('unmatched');
+                    unmatchedDiv.innerHTML = '';
+                    if (unmatched.length === 0) {
+                        unmatchedDiv.innerHTML = '<div class="unmatched-entry"><span class="log-info">No unmatched SKUs</span></div>';
+                    } else {
+                        unmatched.slice(0, 50).forEach(item => {
+                            const div = document.createElement('div');
+                            div.className = 'unmatched-entry';
+                            div.innerHTML = \`
+                                <div class="unmatched-sku">❌ \${item.sku}</div>
+                                <div class="change-title">\${item.title || item.sku}</div>
+                                <div style="color:#555;font-size:9px;">Normalized: \${item.normalized}</div>
+                                <div style="color:#FFAA00;font-size:9px;">Reason: \${item.reason}</div>
+                            \`;
+                            unmatchedDiv.appendChild(div);
+                        });
+                    }
+                }
+                
+                async function clearAll() {
+                    document.getElementById('logs').innerHTML = '<div class="log-entry"><span class="log-info">> LOGS_CLEARED</span></div>';
+                    document.getElementById('changes').innerHTML = '<div class="change-entry"><span class="log-info">No changes yet</span></div>';
+                    document.getElementById('unmatched').innerHTML = '<div class="unmatched-entry"><span class="log-info">No unmatched SKUs</span></div>';
+                }
+                
+                async function refreshHealth() {
+                    const response = await fetch('/health');
+                    const health = await response.json();
+                    document.getElementById('uptime').innerHTML = \`UPTIME: \${health.uptime}\`;
+                }
+                
+                connectSSE();
+                loadPriceChanges();
+                loadUnmatched();
+                refreshHealth();
+                setInterval(loadPriceChanges, 10000);
+                setInterval(loadUnmatched, 10000);
+                setInterval(refreshHealth, 30000);
+            </script>
+        </body>
+        </html>
+    `);
+});
+
+// ================= CLEAR ENDPOINTS =================
+
+app.post("/clear-logs", (req, res) => {
+    syncLogs = [];
+    res.json({ success: true });
+});
+
+app.post("/clear-changes", (req, res) => {
+    priceChanges = [];
+    unmatchedSkus = [];
+    res.json({ success: true });
+});
+
+// ================= AUTH ROUTES =================
+
+app.get("/auth", (req, res) => {
+    const url = `https://${SHOP}/admin/oauth/authorize?client_id=${CLIENT_ID}&scope=${SCOPES}&redirect_uri=${REDIRECT_URI}`;
+    res.redirect(url);
+});
+
+app.get("/auth/callback", async (req, res) => {
+    const { code } = req.query;
+    try {
+        const response = await fetch(`https://${SHOP}/admin/oauth/access_token`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ 
+                client_id: CLIENT_ID, 
+                client_secret: CLIENT_SECRET, 
+                code 
+            }),
+        });
+        const data = await response.json();
+        
+        if (data.access_token) {
+            saveToken(data.access_token, null, data.refresh_token);
+            loadSyncState();
+            
+            res.send(`
+                <!DOCTYPE html>
+                <html>
+                <head><title>Auth Success</title></head>
+                <body style="background:#0C0C0C; color:#00FF41; font-family: monospace; text-align: center; padding: 50px;">
+                    <h2>✅ AUTHENTICATION_SUCCESSFUL</h2>
+                    <p>Token saved successfully!</p>
+                    <p>Redirecting to dashboard...</p>
+                    <script>setTimeout(() => { window.location.href = '/'; }, 2000);</script>
+                </body>
+                </html>
+            `);
+        } else {
+            res.status(400).send(`❌ Auth Failed: ${JSON.stringify(data)}`);
+        }
+    } catch (err) {
+        res.status(500).send(`❌ Auth Error: ${err.message}`);
+    }
+});
 
 // ================= AUTO-START =================
 
