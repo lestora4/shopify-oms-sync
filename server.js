@@ -107,31 +107,79 @@ async function lookupSkuInOMS(sku) {
             headers: { "X-Pavo-Token": OMS_API_KEY }
         });
         
-        if (!response.ok) return null;
+        if (!response.ok) {
+            if (Math.random() < 0.01) {
+                addLog(`⚠️ OMS API error for ${sku}: ${response.status}`, "warning");
+            }
+            return null;
+        }
         
         const data = await response.json();
-        if (!data.variants || data.variants.length === 0) return null;
+        
+        // Check if we got variants
+        if (!data.variants || data.variants.length === 0) {
+            return null;
+        }
         
         // Find the best variant (piece > each > other)
-        let selectedVariant = data.variants.find(v => 
-            v.unit?.type?.toLowerCase() === "piece"
-        ) || data.variants.find(v => 
-            v.unit?.type?.toLowerCase() === "each"
-        ) || data.variants.find(v => 
-            !v.sku?.toLowerCase().includes("_box") && 
-            !v.sku?.toLowerCase().includes("_case")
-        ) || data.variants[0];
+        let selectedVariant = null;
         
-        if (!selectedVariant) return null;
+        // Try to find "piece" unit first
+        selectedVariant = data.variants.find(v => 
+            v.unit && v.unit.type && v.unit.type.toLowerCase() === "piece"
+        );
         
-        // Extract prices using getPrice function
-        const silver = getPrice(selectedVariant.prices, "Silver");
-        const gold = getPrice(selectedVariant.prices, "Gold");
-        const platinum = getPrice(selectedVariant.prices, "Platinum");
+        // If no piece, try "each"
+        if (!selectedVariant) {
+            selectedVariant = data.variants.find(v => 
+                v.unit && v.unit.type && v.unit.type.toLowerCase() === "each"
+            );
+        }
         
-        // Log success for AURA-SPK-BK
-        if (sku === "AURA-SPK-BK") {
-            addLog(`✅ AURA-SPK-BK found: S:$${silver} G:$${gold} P:$${platinum}`, "success");
+        // If still none, take first non-box/case variant
+        if (!selectedVariant) {
+            selectedVariant = data.variants.find(v => 
+                v.sku && 
+                !v.sku.toLowerCase().includes("_box") && 
+                !v.sku.toLowerCase().includes("_case")
+            );
+        }
+        
+        // Last resort: first variant
+        if (!selectedVariant && data.variants.length > 0) {
+            selectedVariant = data.variants[0];
+        }
+        
+        if (!selectedVariant) {
+            return null;
+        }
+        
+        // Extract prices - CRITICAL FIX: Access prices.business_type
+        const prices = selectedVariant.prices;
+        if (!prices || !prices.business_type) {
+            return null;
+        }
+        
+        // Find each price type (handle "Platimum" typo)
+        let silver = 0;
+        let gold = 0;
+        let platinum = 0;
+        
+        for (const p of prices.business_type) {
+            if (!p.type) continue;
+            const type = p.type.toLowerCase();
+            if (type === "silver") {
+                silver = Number(p.value) || 0;
+            } else if (type === "gold") {
+                gold = Number(p.value) || 0;
+            } else if (type === "platinum" || type === "platimum") {
+                platinum = Number(p.value) || 0;
+            }
+        }
+        
+        // Debug log for AURA-SPK-BK
+        if (sku === "AURA-SPK-BK" || sku === "IP16E-CH39-BLK") {
+            addLog(`✅ ${sku} found: S:$${silver} G:$${gold} P:$${platinum} (${selectedVariant.unit?.type})`, "success");
         }
         
         return {
@@ -143,13 +191,12 @@ async function lookupSkuInOMS(sku) {
         };
         
     } catch (err) {
-        if (sku === "AURA-SPK-BK") {
-            addLog(`❌ Error looking up AURA-SPK-BK: ${err.message}`, "error");
+        if (Math.random() < 0.01) {
+            addLog(`❌ OMS error for ${sku}: ${err.message}`, "error");
         }
         return null;
     }
 }
-
 function addLog(message, type = "info") {
     const timestamp = new Date().toISOString();
     const logEntry = { timestamp, message, type };
