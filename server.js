@@ -81,15 +81,93 @@ function normalizeSku(sku) {
 function getPrice(prices, type) {
     if (!prices || !prices.business_type) return 0;
     const searchType = type.toLowerCase();
-    const found = prices.business_type.find(x => x.type && x.type.toLowerCase() === searchType);
     
+    // Direct match
+    const found = prices.business_type.find(x => 
+        x.type && x.type.toLowerCase() === searchType
+    );
+    
+    // Special handling for platinum (including typos)
     if (!found && searchType === "platinum") {
-        const platFound = prices.business_type.find(x => x.type && x.type.toLowerCase() === "platimum");
+        // Try common typos from OMS
+        const platFound = prices.business_type.find(x => {
+            if (!x.type) return false;
+            const lower = x.type.toLowerCase();
+            return lower === "platimum" ||      // Missing 'i'
+                   lower === "platnium" ||      // Missing 'i'
+                   lower === "platinum" ||      // Correct spelling
+                   lower === "plat" ||          // Short version
+                   lower.includes("plati");     // Contains plati
+        });
         return platFound ? Number(platFound.value) : 0;
     }
+    
     return found ? Number(found.value) : 0;
 }
 
+// Update lookupSkuInOMS to handle the typo
+async function lookupSkuInOMS(sku) {
+    try {
+        const url = `https://api.omspavo.com/product/variants?item_num=${encodeURIComponent(sku)}`;
+        const response = await fetch(url, {
+            headers: { "X-Pavo-Token": OMS_API_KEY },
+        });
+        
+        if (!response.ok) return null;
+        
+        const data = await response.json();
+        if (!data.variants || data.variants.length === 0) return null;
+        
+        // Priority: piece > each > other
+        let selectedVariant = null;
+        
+        // Try "piece" first
+        selectedVariant = data.variants.find(v => 
+            v.unit?.type?.toLowerCase() === "piece"
+        );
+        
+        // If no piece, try "each"
+        if (!selectedVariant) {
+            selectedVariant = data.variants.find(v => 
+                v.unit?.type?.toLowerCase() === "each"
+            );
+        }
+        
+        // If still none, take first non-box/case variant
+        if (!selectedVariant) {
+            selectedVariant = data.variants.find(v => 
+                !v.sku.toLowerCase().includes("_box") && 
+                !v.sku.toLowerCase().includes("_case")
+            );
+        }
+        
+        // Last resort: first variant
+        if (!selectedVariant && data.variants.length > 0) {
+            selectedVariant = data.variants[0];
+        }
+        
+        if (!selectedVariant) return null;
+        
+        // Get prices with typo handling
+        const silver = getPrice(selectedVariant.prices, "Silver");
+        const gold = getPrice(selectedVariant.prices, "Gold");
+        const platinum = getPrice(selectedVariant.prices, "Platinum");
+        
+        addLog(`   📦 ${sku}: ${selectedVariant.unit?.type || 'unknown'} - S:$${silver} G:$${gold} P:$${platinum}`, "info");
+        
+        return {
+            silver: silver,
+            gold: gold,
+            platinum: platinum,
+            originalSku: selectedVariant.sku,
+            unit: selectedVariant.unit?.type
+        };
+        
+    } catch (err) {
+        addLog(`   ❌ OMS lookup error for ${sku}: ${err.message}`, "error");
+        return null;
+    }
+}
 function addLog(message, type = "info") {
     const timestamp = new Date().toISOString();
     const logEntry = { timestamp, message, type };
