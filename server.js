@@ -23,10 +23,10 @@ const PLATINUM_PRICE_LIST = "gid://shopify/PriceList/32259834162";
 
 const OMS_API_KEY = "1ae0b8a9-520b-28c2-737b-ec5f52198036";
 
-// ================= PERFORMANCE CONFIG =================
-const CONCURRENT_REQUESTS = 30;
+// ================= PERFORMANCE CONFIG - REDUCED TO AVOID 403 =================
+const CONCURRENT_REQUESTS = 5;  // Reduced from 30 to avoid rate limiting
 const BATCH_UPDATE_SIZE = 100;
-const REQUEST_DELAY_MS = 10;
+const REQUEST_DELAY_MS = 200;   // Increased delay between batches
 
 // ================= TOKEN MANAGEMENT =================
 let tokenData = {
@@ -77,7 +77,7 @@ function normalizeSku(sku) {
         .replace(/^[-_]+|[-_]+$/g, '');
 }
 
-// ================= FIXED getPrice =================
+// ================= getPrice =================
 
 function getPrice(prices, type) {
     if (!prices || !prices.business_type) return 0;
@@ -96,7 +96,9 @@ function getPrice(prices, type) {
     return found ? Number(found.value) : 0;
 }
 
-async function lookupSkuInOMS(sku) {
+// ================= FIXED lookupSkuInOMS with RETRY LOGIC =================
+
+async function lookupSkuInOMS(sku, retryCount = 0) {
     if (!sku) return null;
     
     try {
@@ -104,6 +106,19 @@ async function lookupSkuInOMS(sku) {
         const response = await fetch(url, {
             headers: { "X-Pavo-Token": OMS_API_KEY }
         });
+        
+        // Handle 403 Forbidden - retry with backoff
+        if (response.status === 403) {
+            if (retryCount < 3) {
+                const delay = (retryCount + 1) * 3000; // 3s, 6s, 9s
+                addLog(`⚠️ 403 for ${sku}, retry ${retryCount + 1}/3 in ${delay/1000}s`, "warning");
+                await new Promise(r => setTimeout(r, delay));
+                return lookupSkuInOMS(sku, retryCount + 1);
+            } else {
+                addLog(`❌ 403 for ${sku} after 3 retries - skipping`, "error");
+                return null;
+            }
+        }
         
         if (!response.ok) {
             if (Math.random() < 0.01) {
@@ -114,7 +129,6 @@ async function lookupSkuInOMS(sku) {
         
         const data = await response.json();
         
-        // Check if we got variants
         if (!data.variants || data.variants.length === 0) {
             return null;
         }
@@ -122,19 +136,16 @@ async function lookupSkuInOMS(sku) {
         // Find the best variant (piece > each > other)
         let selectedVariant = null;
         
-        // Try to find "piece" unit first
         selectedVariant = data.variants.find(v => 
             v.unit && v.unit.type && v.unit.type.toLowerCase() === "piece"
         );
         
-        // If no piece, try "each"
         if (!selectedVariant) {
             selectedVariant = data.variants.find(v => 
                 v.unit && v.unit.type && v.unit.type.toLowerCase() === "each"
             );
         }
         
-        // If still none, take first non-box/case variant
         if (!selectedVariant) {
             selectedVariant = data.variants.find(v => 
                 v.sku && 
@@ -143,7 +154,6 @@ async function lookupSkuInOMS(sku) {
             );
         }
         
-        // Last resort: first variant
         if (!selectedVariant && data.variants.length > 0) {
             selectedVariant = data.variants[0];
         }
@@ -152,13 +162,11 @@ async function lookupSkuInOMS(sku) {
             return null;
         }
         
-        // Extract prices - CRITICAL FIX: Access prices.business_type
         const prices = selectedVariant.prices;
         if (!prices || !prices.business_type) {
             return null;
         }
         
-        // Find each price type (handle "Platimum" typo)
         let silver = 0;
         let gold = 0;
         let platinum = 0;
@@ -175,7 +183,7 @@ async function lookupSkuInOMS(sku) {
             }
         }
         
-        // Debug log for AURA-SPK-BK
+        // Debug log for specific SKUs
         if (sku === "AURA-SPK-BK" || sku === "IP16E-CH39-BLK") {
             addLog(`✅ ${sku} found: S:$${silver} G:$${gold} P:$${platinum} (${selectedVariant.unit?.type})`, "success");
         }
@@ -189,12 +197,18 @@ async function lookupSkuInOMS(sku) {
         };
         
     } catch (err) {
+        if (retryCount < 3) {
+            addLog(`⚠️ Error for ${sku}, retry ${retryCount + 1}/3`, "warning");
+            await new Promise(r => setTimeout(r, 2000));
+            return lookupSkuInOMS(sku, retryCount + 1);
+        }
         if (Math.random() < 0.01) {
             addLog(`❌ OMS error for ${sku}: ${err.message}`, "error");
         }
         return null;
     }
 }
+
 function addLog(message, type = "info") {
     const timestamp = new Date().toISOString();
     const logEntry = { timestamp, message, type };
@@ -474,6 +488,7 @@ function startEfficientPolling() {
     }, 7200000);
     
     addLog("🔔 Started efficient OMS polling (every 2 hours)", "success");
+    addLog(`   ⚡ Using ${CONCURRENT_REQUESTS} concurrent requests to avoid 403 errors`, "info");
 }
 
 // ================= MANUAL PRICE CHANGE DETECTION =================
@@ -589,7 +604,7 @@ function startManualPriceMonitoring() {
         if (!isRunning) {
             await detectManualPriceChanges();
         }
-    }, 300000); // 5 minutes
+    }, 300000);
     
     addLog("🔔 Started manual price change monitoring (every 5 minutes)", "success");
 }
@@ -623,6 +638,7 @@ async function runSync() {
     addLog("=".repeat(70), "info");
     addLog("🚀 STARTING OMS TO SHOPIFY PRICE SYNC", "info");
     addLog(`⚡ Concurrent lookups: ${CONCURRENT_REQUESTS} parallel requests`, "info");
+    addLog(`⏱️  Request delay: ${REQUEST_DELAY_MS}ms between batches`, "info");
     addLog("=".repeat(70), "info");
     
     try {
@@ -640,6 +656,7 @@ async function runSync() {
         }
         
         addLog(`\n🎯 Step 2: Looking up ${shopifyVariants.length} SKUs in OMS (${CONCURRENT_REQUESTS} concurrent)...`, "info");
+        addLog(`   ⚠️  Will retry 403 errors up to 3 times with backoff`, "info");
         
         const lookupResults = await processConcurrently(
             shopifyVariants,
@@ -1129,7 +1146,8 @@ app.get("/", (req, res) => {
                         <div class="panel-header">📋 SYNC_LOGS</div>
                         <div class="logs-container" id="logs">
                             <div class="log-entry"><span class="log-info">> OMS SYNC READY</span></div>
-                            <div class="log-entry"><span class="log-info">> 30 concurrent requests | 100 products/batch</span></div>
+                            <div class="log-entry"><span class="log-info">> 5 concurrent requests | 100 products/batch</span></div>
+                            <div class="log-entry"><span class="log-info">> 403 retry with backoff enabled</span></div>
                         </div>
                     </div>
                     <div class="panel">
@@ -1206,7 +1224,7 @@ app.get("/", (req, res) => {
 
                 async function startFullSync() {
                     addLog('🔄 FULL_SYNC_TRIGGERED - This will sync ALL products', 'warning');
-                    addLog('⚠️ This may take 5-10 minutes for 2000+ products', 'warning');
+                    addLog('⚠️ This may take 10-15 minutes for 2000+ products (rate limited)', 'warning');
                     const response = await fetch('/full-sync', { method: 'POST' });
                     const data = await response.json();
                     if (data.success) {
@@ -1370,6 +1388,7 @@ setTimeout(async () => {
         addLog("   ⚡ AUTO-POLL: Every 2 hours (only changed products)", "info");
         addLog("   💰 Detects price changes automatically", "info");
         addLog("   🆕 Detects new products automatically", "info");
+        addLog(`   🐢 Using ${CONCURRENT_REQUESTS} concurrent requests to avoid 403 errors`, "info");
         
         startEfficientPolling();
         startManualPriceMonitoring();
@@ -1395,9 +1414,10 @@ app.listen(PORT, () => {
     console.log("  ╚════════════════════════════════════════════════╝");
     console.log("=".repeat(60));
     console.log("\n  ⚡ OPTIMIZATIONS:");
-    console.log("     30 concurrent requests");
+    console.log(`     ${CONCURRENT_REQUESTS} concurrent requests (reduced to avoid 403)`);
     console.log("     100 products per batch");
-    console.log("     10ms delay between batches");
+    console.log(`     ${REQUEST_DELAY_MS}ms delay between batches`);
+    console.log("     403 retry with exponential backoff");
     console.log("\n  📊 FEATURES:");
     console.log("     - Auto price sync every 2 hours");
     console.log("     - New product detection");
