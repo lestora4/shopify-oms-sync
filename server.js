@@ -80,37 +80,28 @@ function normalizeSku(sku) {
 
 function getPrice(prices, type) {
     if (!prices || !prices.business_type) return 0;
+    
+    // Handle "Platimum" typo
     const searchType = type.toLowerCase();
-    
-    // Direct match
-    const found = prices.business_type.find(x => 
-        x.type && x.type.toLowerCase() === searchType
-    );
-    
-    // Special handling for platinum (including typos)
-    if (!found && searchType === "platinum") {
-        // Try common typos from OMS
-        const platFound = prices.business_type.find(x => {
-            if (!x.type) return false;
-            const lower = x.type.toLowerCase();
-            return lower === "platimum" ||      // Missing 'i'
-                   lower === "platnium" ||      // Missing 'i'
-                   lower === "platinum" ||      // Correct spelling
-                   lower === "plat" ||          // Short version
-                   lower.includes("plati");     // Contains plati
-        });
-        return platFound ? Number(platFound.value) : 0;
-    }
+    const found = prices.business_type.find(p => {
+        if (!p.type) return false;
+        const pType = p.type.toLowerCase();
+        
+        if (searchType === "platinum") {
+            return pType === "platinum" || pType === "platimum";
+        }
+        return pType === searchType;
+    });
     
     return found ? Number(found.value) : 0;
 }
-
-// Update lookupSkuInOMS to handle the typo
 async function lookupSkuInOMS(sku) {
+    if (!sku) return null;
+    
     try {
         const url = `https://api.omspavo.com/product/variants?item_num=${encodeURIComponent(sku)}`;
         const response = await fetch(url, {
-            headers: { "X-Pavo-Token": OMS_API_KEY },
+            headers: { "X-Pavo-Token": OMS_API_KEY }
         });
         
         if (!response.ok) return null;
@@ -118,53 +109,37 @@ async function lookupSkuInOMS(sku) {
         const data = await response.json();
         if (!data.variants || data.variants.length === 0) return null;
         
-        // Priority: piece > each > other
-        let selectedVariant = null;
-        
-        // Try "piece" first
-        selectedVariant = data.variants.find(v => 
+        // Find the best variant (piece > each > other)
+        let selectedVariant = data.variants.find(v => 
             v.unit?.type?.toLowerCase() === "piece"
-        );
-        
-        // If no piece, try "each"
-        if (!selectedVariant) {
-            selectedVariant = data.variants.find(v => 
-                v.unit?.type?.toLowerCase() === "each"
-            );
-        }
-        
-        // If still none, take first non-box/case variant
-        if (!selectedVariant) {
-            selectedVariant = data.variants.find(v => 
-                !v.sku.toLowerCase().includes("_box") && 
-                !v.sku.toLowerCase().includes("_case")
-            );
-        }
-        
-        // Last resort: first variant
-        if (!selectedVariant && data.variants.length > 0) {
-            selectedVariant = data.variants[0];
-        }
+        ) || data.variants.find(v => 
+            v.unit?.type?.toLowerCase() === "each"
+        ) || data.variants.find(v => 
+            !v.sku?.toLowerCase().includes("_box") && 
+            !v.sku?.toLowerCase().includes("_case")
+        ) || data.variants[0];
         
         if (!selectedVariant) return null;
         
-        // Get prices with typo handling
-        const silver = getPrice(selectedVariant.prices, "Silver");
-        const gold = getPrice(selectedVariant.prices, "Gold");
-        const platinum = getPrice(selectedVariant.prices, "Platinum");
+        // Extract prices
+        const prices = selectedVariant.prices;
+        if (!prices?.business_type) return null;
         
-        addLog(`   📦 ${sku}: ${selectedVariant.unit?.type || 'unknown'} - S:$${silver} G:$${gold} P:$${platinum}`, "info");
+        const silver = prices.business_type.find(p => p.type === "Silver")?.value || 0;
+        const gold = prices.business_type.find(p => p.type === "Gold")?.value || 0;
+        const platinum = prices.business_type.find(p => 
+            p.type === "Platinum" || p.type === "Platimum"
+        )?.value || 0;
         
         return {
-            silver: silver,
-            gold: gold,
-            platinum: platinum,
+            silver: Number(silver),
+            gold: Number(gold),
+            platinum: Number(platinum),
             originalSku: selectedVariant.sku,
             unit: selectedVariant.unit?.type
         };
         
     } catch (err) {
-        addLog(`   ❌ OMS lookup error for ${sku}: ${err.message}`, "error");
         return null;
     }
 }
