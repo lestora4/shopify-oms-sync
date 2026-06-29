@@ -95,10 +95,7 @@ function getPrice(prices, type) {
     
     return found ? Number(found.value) : 0;
 }
-
-// ================= FIXED lookupSkuInOMS with RETRY LOGIC =================
-
-async function lookupSkuInOMS(sku, retryCount = 0) {
+async function lookupSkuInOMS(sku) {
     if (!sku) return null;
     
     try {
@@ -107,21 +104,9 @@ async function lookupSkuInOMS(sku, retryCount = 0) {
             headers: { "X-Pavo-Token": OMS_API_KEY }
         });
         
-        // Handle 403 Forbidden - retry with backoff
-        if (response.status === 403) {
-            if (retryCount < 3) {
-                const delay = (retryCount + 1) * 3000; // 3s, 6s, 9s
-                addLog(`⚠️ 403 for ${sku}, retry ${retryCount + 1}/3 in ${delay/1000}s`, "warning");
-                await new Promise(r => setTimeout(r, delay));
-                return lookupSkuInOMS(sku, retryCount + 1);
-            } else {
-                addLog(`❌ 403 for ${sku} after 3 retries - skipping`, "error");
-                return null;
-            }
-        }
-        
         if (!response.ok) {
-            if (Math.random() < 0.01) {
+            // Log the error for debugging
+            if (sku.startsWith("A37-5G")) {
                 addLog(`⚠️ OMS API error for ${sku}: ${response.status}`, "warning");
             }
             return null;
@@ -133,10 +118,13 @@ async function lookupSkuInOMS(sku, retryCount = 0) {
             return null;
         }
         
-        // Find the best variant (piece > each > other)
-        let selectedVariant = null;
+        // Log what we found for debugging
+        if (sku.startsWith("A37-5G")) {
+            addLog(`🔍 Found ${data.variants.length} variants for ${sku}`, "info");
+        }
         
-        selectedVariant = data.variants.find(v => 
+        // Find the best variant (piece > each > other)
+        let selectedVariant = data.variants.find(v => 
             v.unit && v.unit.type && v.unit.type.toLowerCase() === "piece"
         );
         
@@ -159,11 +147,24 @@ async function lookupSkuInOMS(sku, retryCount = 0) {
         }
         
         if (!selectedVariant) {
+            if (sku.startsWith("A37-5G")) {
+                addLog(`❌ No suitable variant for ${sku}`, "error");
+            }
             return null;
         }
         
+        // Log the selected variant
+        if (sku.startsWith("A37-5G")) {
+            addLog(`   Selected variant: ${selectedVariant.sku} (${selectedVariant.unit?.type})`, "info");
+            addLog(`   Prices: ${JSON.stringify(selectedVariant.prices?.business_type)}`, "info");
+        }
+        
+        // Extract prices
         const prices = selectedVariant.prices;
         if (!prices || !prices.business_type) {
+            if (sku.startsWith("A37-5G")) {
+                addLog(`❌ No prices for ${sku}`, "error");
+            }
             return null;
         }
         
@@ -183,9 +184,9 @@ async function lookupSkuInOMS(sku, retryCount = 0) {
             }
         }
         
-        // Debug log for specific SKUs
-        if (sku === "AURA-SPK-BK" || sku === "IP16E-CH39-BLK") {
-            addLog(`✅ ${sku} found: S:$${silver} G:$${gold} P:$${platinum} (${selectedVariant.unit?.type})`, "success");
+        // Log success for A37-5G SKUs
+        if (sku.startsWith("A37-5G")) {
+            addLog(`✅ ${sku} prices: S:$${silver} G:$${gold} P:$${platinum}`, "success");
         }
         
         return {
@@ -197,18 +198,12 @@ async function lookupSkuInOMS(sku, retryCount = 0) {
         };
         
     } catch (err) {
-        if (retryCount < 3) {
-            addLog(`⚠️ Error for ${sku}, retry ${retryCount + 1}/3`, "warning");
-            await new Promise(r => setTimeout(r, 2000));
-            return lookupSkuInOMS(sku, retryCount + 1);
-        }
-        if (Math.random() < 0.01) {
-            addLog(`❌ OMS error for ${sku}: ${err.message}`, "error");
+        if (sku.startsWith("A37-5G")) {
+            addLog(`❌ Error looking up ${sku}: ${err.message}`, "error");
         }
         return null;
     }
 }
-
 function addLog(message, type = "info") {
     const timestamp = new Date().toISOString();
     const logEntry = { timestamp, message, type };
