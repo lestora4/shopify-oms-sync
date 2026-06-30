@@ -95,6 +95,8 @@ function getPrice(prices, type) {
     
     return found ? Number(found.value) : 0;
 }
+// ================= LOOKUP SKU IN OMS (FIXED) =================
+
 async function lookupSkuInOMS(sku) {
     if (!sku) return null;
     
@@ -105,8 +107,8 @@ async function lookupSkuInOMS(sku) {
         });
         
         if (!response.ok) {
-            // Log the error for debugging
-            if (sku.startsWith("A37-5G")) {
+            // Only log errors occasionally to avoid spam
+            if (Math.random() < 0.01) {
                 addLog(`⚠️ OMS API error for ${sku}: ${response.status}`, "warning");
             }
             return null;
@@ -116,11 +118,6 @@ async function lookupSkuInOMS(sku) {
         
         if (!data.variants || data.variants.length === 0) {
             return null;
-        }
-        
-        // Log what we found for debugging
-        if (sku.startsWith("A37-5G")) {
-            addLog(`🔍 Found ${data.variants.length} variants for ${sku}`, "info");
         }
         
         // Find the best variant (piece > each > other)
@@ -147,24 +144,12 @@ async function lookupSkuInOMS(sku) {
         }
         
         if (!selectedVariant) {
-            if (sku.startsWith("A37-5G")) {
-                addLog(`❌ No suitable variant for ${sku}`, "error");
-            }
             return null;
         }
         
-        // Log the selected variant
-        if (sku.startsWith("A37-5G")) {
-            addLog(`   Selected variant: ${selectedVariant.sku} (${selectedVariant.unit?.type})`, "info");
-            addLog(`   Prices: ${JSON.stringify(selectedVariant.prices?.business_type)}`, "info");
-        }
-        
-        // Extract prices
+        // CRITICAL: Extract prices from business_type array
         const prices = selectedVariant.prices;
         if (!prices || !prices.business_type) {
-            if (sku.startsWith("A37-5G")) {
-                addLog(`❌ No prices for ${sku}`, "error");
-            }
             return null;
         }
         
@@ -184,9 +169,9 @@ async function lookupSkuInOMS(sku) {
             }
         }
         
-        // Log success for A37-5G SKUs
-        if (sku.startsWith("A37-5G")) {
-            addLog(`✅ ${sku} prices: S:$${silver} G:$${gold} P:$${platinum}`, "success");
+        // Log success for A37-5G SKUs to verify
+        if (sku.startsWith("A37-5G") || sku === "A37-5G-CH56-BLK") {
+            addLog(`✅ ${sku} found: S:$${silver} G:$${gold} P:$${platinum} (${selectedVariant.unit?.type})`, "success");
         }
         
         return {
@@ -198,7 +183,7 @@ async function lookupSkuInOMS(sku) {
         };
         
     } catch (err) {
-        if (sku.startsWith("A37-5G")) {
+        if (sku === "A37-5G-CH56-BLK") {
             addLog(`❌ Error looking up ${sku}: ${err.message}`, "error");
         }
         return null;
