@@ -24,9 +24,9 @@ const PLATINUM_PRICE_LIST = "gid://shopify/PriceList/32259834162";
 const OMS_API_KEY = "1ae0b8a9-520b-28c2-737b-ec5f52198036";
 
 // ================= PERFORMANCE CONFIG - REDUCED TO AVOID 403 =================
-const CONCURRENT_REQUESTS = 5;  // Reduced from 30 to avoid rate limiting
+const CONCURRENT_REQUESTS = 2;  // Reduced from 30 to avoid rate limiting
 const BATCH_UPDATE_SIZE = 100;
-const REQUEST_DELAY_MS = 200;   // Increased delay between batches
+const REQUEST_DELAY_MS = 500;   // Increased delay between batches
 
 // ================= TOKEN MANAGEMENT =================
 let tokenData = {
@@ -39,6 +39,7 @@ let isRunning = false;
 let syncLogs = [];
 let priceChanges = [];
 let unmatchedSkus = [];
+const omsFailReasons = new Map();
 let currentSync = null;
 let lastSyncState = { lastSyncTime: null, lastProductCount: 0, syncedSkus: [] };
 
@@ -97,8 +98,9 @@ function getPrice(prices, type) {
 }
 // ================= LOOKUP SKU IN OMS (FIXED) =================
 
-async function lookupSkuInOMS(sku) {
+async function lookupSkuInOMS(sku, attempt = 0) {
     if (!sku) return null;
+    omsFailReasons.delete(sku);
     
     try {
         const url = `https://api.omspavo.com/product/variants?item_num=${encodeURIComponent(sku)}`;
@@ -107,16 +109,20 @@ async function lookupSkuInOMS(sku) {
         });
         
         if (!response.ok) {
-            // Only log errors occasionally to avoid spam
-            if (Math.random() < 0.01) {
-                addLog(`⚠️ OMS API error for ${sku}: ${response.status}`, "warning");
+            // Retry blocked / rate-limited / server errors with backoff
+            if ((response.status === 403 || response.status === 429 || response.status >= 500) && attempt < 3) {
+                await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt)));
+                return lookupSkuInOMS(sku, attempt + 1);
             }
+            omsFailReasons.set(sku, `OMS API error HTTP ${response.status} (request failed, not a missing SKU)`);
+            addLog(`⚠️ OMS API error for ${sku}: ${response.status}`, "warning");
             return null;
         }
         
         const data = await response.json();
         
         if (!data.variants || data.variants.length === 0) {
+            omsFailReasons.set(sku, "Not found in OMS (no variants returned for this SKU)");
             return null;
         }
         
@@ -150,6 +156,7 @@ async function lookupSkuInOMS(sku) {
         // CRITICAL: Extract prices from business_type array
         const prices = selectedVariant.prices;
         if (!prices || !prices.business_type) {
+            omsFailReasons.set(sku, "Found in OMS but no business_type prices");
             return null;
         }
         
@@ -183,6 +190,11 @@ async function lookupSkuInOMS(sku) {
         };
         
     } catch (err) {
+        if (attempt < 3) {
+            await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt)));
+            return lookupSkuInOMS(sku, attempt + 1);
+        }
+        omsFailReasons.set(sku, `OMS request failed: ${err.message}`);
         if (sku === "A37-5G-CH56-BLK") {
             addLog(`❌ Error looking up ${sku}: ${err.message}`, "error");
         }
@@ -222,7 +234,7 @@ function addUnmatchedSku(sku, title, reason) {
         reason: reason,
         normalized: normalizeSku(sku)
     });
-    if (unmatchedSkus.length > 500) unmatchedSkus.pop();
+    if (unmatchedSkus.length > 20000) unmatchedSkus.pop();
 }
 
 // ================= TOKEN HELPERS =================
@@ -647,7 +659,7 @@ async function runSync() {
                 if (omsPrices) {
                     return { ...variant, omsPrices, found: true };
                 } else {
-                    addUnmatchedSku(variant.sku, variant.title, "Not found in OMS or no piece unit");
+                    addUnmatchedSku(variant.sku, variant.title, omsFailReasons.get(variant.sku) || "Not found in OMS or no piece unit");
                     return { ...variant, omsPrices: null, found: false };
                 }
             }
@@ -949,7 +961,19 @@ async function syncSingleSku(sku, source = "webhook") {
 // ================= API ENDPOINTS =================
 
 app.get("/unmatched-skus", (req, res) => {
-    res.json(unmatchedSkus.slice(0, 200));
+    res.json(req.query.all ? unmatchedSkus : unmatchedSkus.slice(0, 200));
+});
+
+// Full unmatched list as a CSV download (opens in Excel)
+app.get("/unmatched-skus.csv", (req, res) => {
+    const esc = v => `"${String(v == null ? "" : v).replace(/"/g, '""')}"`;
+    const rows = [["sku", "title", "reason", "normalized", "timestamp"].join(",")];
+    for (const u of unmatchedSkus) {
+        rows.push([u.sku, u.title, u.reason, u.normalized, u.timestamp].map(esc).join(","));
+    }
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", 'attachment; filename="unmatched-skus.csv"');
+    res.send("\ufeff" + rows.join("\r\n"));
 });
 
 app.get("/price-changes", (req, res) => {
@@ -1110,6 +1134,7 @@ app.get("/", (req, res) => {
                         <button class="cmd-btn" onclick="window.location.href='/auth'">🔑 AUTH</button>
                         <button class="cmd-btn" onclick="clearAll()">🗑 CLEAR ALL</button>
                         <button class="cmd-btn" onclick="refreshHealth()">🔄 HEALTH</button>
+                        <button class="cmd-btn" onclick="window.location.href='/unmatched-skus.csv'">⬇ UNMATCHED CSV</button>
                     </div>
                 </div>
                 
