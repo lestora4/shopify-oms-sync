@@ -247,15 +247,52 @@ function addPriceChange(sku, title, oldPrices, newPrices, isNew = false) {
     if (priceChanges.length > 500) priceChanges.pop();
 }
 
-function addUnmatchedSku(sku, title, reason) {
+function addUnmatchedSku(sku, title, reason, variantId = null) {
     unmatchedSkus.unshift({
         timestamp: new Date().toISOString(),
         sku: sku,
         title: title,
         reason: reason,
-        normalized: normalizeSku(sku)
+        normalized: normalizeSku(sku),
+        variantId: variantId
     });
     if (unmatchedSkus.length > 20000) unmatchedSkus.pop();
+}
+
+const UNMATCHED_FILE = "./unmatched_skus.json";
+
+function saveUnmatchedToFile() {
+    try {
+        fs.writeFileSync(UNMATCHED_FILE, JSON.stringify(unmatchedSkus, null, 2));
+    } catch (err) {
+        addLog(`⚠️ Could not save unmatched list: ${err.message}`, "warning");
+    }
+}
+
+function loadUnmatchedFromFile() {
+    if (!fs.existsSync(UNMATCHED_FILE)) return;
+    try {
+        const data = JSON.parse(fs.readFileSync(UNMATCHED_FILE, "utf8"));
+        if (Array.isArray(data)) {
+            unmatchedSkus = data;
+            addLog(`📁 Loaded ${unmatchedSkus.length} unmatched SKUs from last run`, "info");
+        }
+    } catch (err) {
+        addLog(`⚠️ Could not load unmatched list: ${err.message}`, "warning");
+    }
+}
+
+// Full runs replace the synced list; unmatched-only runs just merge into it
+function recordSyncedVariants(allVariants, processedVariants, onlyUnmatched) {
+    lastSyncState.lastSyncTime = new Date().toISOString();
+    lastSyncState.lastProductCount = allVariants.length;
+    if (onlyUnmatched) {
+        const merged = new Set(lastSyncState.syncedSkus);
+        processedVariants.forEach(v => merged.add(normalizeSku(v.sku)));
+        lastSyncState.syncedSkus = Array.from(merged);
+    } else {
+        lastSyncState.syncedSkus = allVariants.map(v => normalizeSku(v.sku));
+    }
 }
 
 // ================= TOKEN HELPERS =================
@@ -611,7 +648,8 @@ function startManualPriceMonitoring() {
 
 // ================= MAIN SYNC FUNCTION =================
 
-async function runSync() {
+async function runSync(options = {}) {
+    const onlyUnmatched = !!options.onlyUnmatched;
     if (isRunning) {
         addLog("⚠️ Sync already in progress, skipping...", "warning");
         return;
@@ -622,7 +660,19 @@ async function runSync() {
     
     isRunning = true;
     const startTime = Date.now();
-    unmatchedSkus = [];
+
+    // Unmatched-only mode: remember which Shopify variants failed last time.
+    // We match by variant ID because the SKU text may have just been corrected in Shopify.
+    let targetVariantIds = null;
+    let targetOldSkus = null;
+    if (onlyUnmatched) {
+        targetVariantIds = new Set(unmatchedSkus.filter(u => u.variantId).map(u => u.variantId));
+        targetOldSkus = new Set(unmatchedSkus.filter(u => !u.variantId).map(u => u.sku));
+        // drop the old entries; anything that still fails is re-added below
+        unmatchedSkus = [];
+    } else {
+        unmatchedSkus = [];
+    }
     
     currentSync = {
         startTime: startTime,
@@ -636,19 +686,25 @@ async function runSync() {
     };
     
     addLog("=".repeat(70), "info");
-    addLog("🚀 STARTING OMS TO SHOPIFY PRICE SYNC", "info");
+    addLog(onlyUnmatched ? "🎯 STARTING UNMATCHED-ONLY SYNC (re-checking previously unmatched SKUs)" : "🚀 STARTING OMS TO SHOPIFY PRICE SYNC", "info");
     addLog(`⚡ Concurrent lookups: ${CONCURRENT_REQUESTS} parallel requests`, "info");
     addLog(`⏱️  Request delay: ${REQUEST_DELAY_MS}ms between batches`, "info");
     addLog("=".repeat(70), "info");
     
     try {
         addLog("\n📡 Step 1: Fetching Shopify variants...", "info");
-        const shopifyVariants = await getAllShopifyVariants();
+        const allVariants = await getAllShopifyVariants();
+        const shopifyVariants = onlyUnmatched
+            ? allVariants.filter(v => targetVariantIds.has(v.id) || targetOldSkus.has(v.sku))
+            : allVariants;
+        if (onlyUnmatched) {
+            addLog(`🎯 Unmatched-only mode: re-checking ${shopifyVariants.length} variants (of ${allVariants.length} total in Shopify)`, "info");
+        }
         currentSync.shopifyVariants = shopifyVariants.length;
         addLog(`✅ Fetched ${shopifyVariants.length} Shopify variants`, "success");
         
         const syncedSkusSet = new Set(lastSyncState.syncedSkus.map(s => normalizeSku(s)));
-        const newProducts = shopifyVariants.filter(v => !syncedSkusSet.has(normalizeSku(v.sku)));
+        const newProducts = onlyUnmatched ? [] : shopifyVariants.filter(v => !syncedSkusSet.has(normalizeSku(v.sku)));
         
         if (newProducts.length > 0) {
             addLog(`\n🆕 Found ${newProducts.length} NEW products since last sync!`, "success");
@@ -667,7 +723,7 @@ async function runSync() {
                 if (omsPrices) {
                     return { ...variant, omsPrices, found: true };
                 } else {
-                    addUnmatchedSku(variant.sku, variant.title, omsFailReasons.get(variant.sku) || "Not found in OMS or no piece unit");
+                    addUnmatchedSku(variant.sku, variant.title, omsFailReasons.get(variant.sku) || "Not found in OMS or no piece unit", variant.id);
                     return { ...variant, omsPrices: null, found: false };
                 }
             }
@@ -676,6 +732,7 @@ async function runSync() {
         const foundInOMS = lookupResults.filter(r => r.found);
         const notFound = lookupResults.filter(r => !r.found);
         currentSync.unmatched = notFound.length;
+        saveUnmatchedToFile();
         
         addLog(`\n✅ Found in OMS: ${foundInOMS.length}`, "success");
         addLog(`❌ Not found in OMS: ${notFound.length}`, notFound.length > 0 ? "warning" : "success");
@@ -715,9 +772,7 @@ async function runSync() {
         if (updates.length === 0) {
             addLog("\n✅ All products are in sync with OMS!", "success");
             
-            lastSyncState.lastSyncTime = new Date().toISOString();
-            lastSyncState.lastProductCount = shopifyVariants.length;
-            lastSyncState.syncedSkus = shopifyVariants.map(v => normalizeSku(v.sku));
+            recordSyncedVariants(allVariants, shopifyVariants, onlyUnmatched);
             saveSyncState();
             
             const duration = ((Date.now() - startTime) / 1000).toFixed(1);
@@ -796,9 +851,7 @@ async function runSync() {
         currentSync.updated = successCount;
         currentSync.errors = errorCount;
         
-        lastSyncState.lastSyncTime = new Date().toISOString();
-        lastSyncState.lastProductCount = shopifyVariants.length;
-        lastSyncState.syncedSkus = shopifyVariants.map(v => normalizeSku(v.sku));
+        recordSyncedVariants(allVariants, shopifyVariants, onlyUnmatched);
         saveSyncState();
         
         const duration = ((Date.now() - startTime) / 1000).toFixed(1);
@@ -819,11 +872,6 @@ async function runSync() {
                 addLog(`   - ${item.sku} (${item.title || 'N/A'})`, "warning");
             });
             
-            fs.writeFileSync("./unmatched_skus.json", JSON.stringify(notFound.map(s => ({
-                sku: s.sku,
-                title: s.title,
-                normalized: normalizeSku(s.sku)
-            })), null, 2));
             addLog(`\n📁 Full unmatched list saved to: unmatched_skus.json`, "info");
         }
         
@@ -1013,6 +1061,18 @@ app.post("/full-sync", async (req, res) => {
     res.json({ success: true, message: "Full sync started" });
 });
 
+app.post("/sync-unmatched", async (req, res) => {
+    if (isRunning) {
+        return res.json({ success: false, error: "Sync already in progress" });
+    }
+    if (unmatchedSkus.length === 0) {
+        return res.json({ success: false, error: "No unmatched SKUs to re-sync. Run a FULL SYNC first." });
+    }
+    addLog(`🎯 UNMATCHED-ONLY SYNC - re-checking ${unmatchedSkus.length} previously unmatched SKUs`, "info");
+    runSync({ onlyUnmatched: true }).catch(console.error);
+    res.json({ success: true, message: "Unmatched-only sync started", count: unmatchedSkus.length });
+});
+
 app.post("/incremental-sync", async (req, res) => {
     if (isRunning) {
         return res.json({ success: false, error: "Sync already in progress" });
@@ -1138,6 +1198,7 @@ app.get("/", (req, res) => {
                     <div class="button-group">
                         <button class="cmd-btn" onclick="startFullSync()" style="background:#00AA33; color:#0C0C0C;">🔄 FULL SYNC</button>
                         <button class="cmd-btn" onclick="startSync()">⚡ INCREMENTAL SYNC</button>
+                        <button class="cmd-btn" onclick="startUnmatchedSync()" style="border-color:#FFAA00; color:#FFAA00;">🎯 SYNC UNMATCHED ONLY</button>
                         <button class="cmd-btn" onclick="checkManualPrices()">🔍 CHECK MANUAL PRICES</button>
                         <button class="cmd-btn" onclick="window.location.href='/auth'">🔑 AUTH</button>
                         <button class="cmd-btn" onclick="clearAll()">🗑 CLEAR ALL</button>
@@ -1232,6 +1293,17 @@ app.get("/", (req, res) => {
                         addLog('INCREMENTAL_SYNC_STARTED - Syncing changed products only', 'success');
                     } else {
                         addLog('SYNC_FAILED: ' + data.error, 'error');
+                    }
+                }
+
+                async function startUnmatchedSync() {
+                    addLog('🎯 UNMATCHED_SYNC_TRIGGERED - re-checking only previously unmatched SKUs', 'info');
+                    const response = await fetch('/sync-unmatched', { method: 'POST' });
+                    const data = await response.json();
+                    if (data.success) {
+                        addLog('UNMATCHED_SYNC_STARTED - ' + data.count + ' SKUs to re-check', 'success');
+                    } else {
+                        addLog('UNMATCHED_SYNC_FAILED: ' + data.error, 'error');
                     }
                 }
 
@@ -1391,6 +1463,7 @@ app.get("/auth/callback", async (req, res) => {
 // ================= AUTO-START =================
 
 loadSyncState();
+loadUnmatchedFromFile();
 loadLastPollTime();
 
 setTimeout(async () => {
