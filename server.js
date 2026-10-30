@@ -98,20 +98,41 @@ function getPrice(prices, type) {
 }
 // ================= LOOKUP SKU IN OMS (FIXED) =================
 
+// Global pacing for OMS calls (OMS returns 429 when called too fast)
+const OMS_MIN_INTERVAL_MS = Number(process.env.OMS_MIN_INTERVAL_MS) || 500;
+let omsNextSlot = 0;
+let omsPauseUntil = 0;
+async function omsThrottle() {
+    const now = Date.now();
+    const slot = Math.max(now, omsNextSlot, omsPauseUntil);
+    omsNextSlot = slot + OMS_MIN_INTERVAL_MS;
+    const wait = slot - now;
+    if (wait > 0) await new Promise(r => setTimeout(r, wait));
+}
+
 async function lookupSkuInOMS(sku, attempt = 0) {
     if (!sku) return null;
     omsFailReasons.delete(sku);
     
     try {
         const url = `https://api.omspavo.com/product/variants?item_num=${encodeURIComponent(sku)}`;
+        await omsThrottle();
         const response = await fetch(url, {
             headers: { "X-Pavo-Token": OMS_API_KEY }
         });
         
         if (!response.ok) {
             // Retry blocked / rate-limited / server errors with backoff
-            if ((response.status === 403 || response.status === 429 || response.status >= 500) && attempt < 3) {
-                await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt)));
+            const maxAttempts = response.status === 429 ? 6 : 3;
+            if ((response.status === 403 || response.status === 429 || response.status >= 500) && attempt < maxAttempts) {
+                let waitMs = 1000 * Math.pow(2, attempt);
+                if (response.status === 429) {
+                    const ra = Number(response.headers.get("retry-after"));
+                    waitMs = ra > 0 ? ra * 1000 : 5000 * (attempt + 1);
+                    // pause ALL OMS lookups, not just this one
+                    omsPauseUntil = Math.max(omsPauseUntil, Date.now() + waitMs);
+                }
+                await new Promise(r => setTimeout(r, waitMs));
                 return lookupSkuInOMS(sku, attempt + 1);
             }
             omsFailReasons.set(sku, `OMS API error HTTP ${response.status} (request failed, not a missing SKU)`);
