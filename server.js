@@ -294,10 +294,15 @@ async function shopifyGraphQL(query, variables = {}, retryCount = 0) {
         });
 
         const json = await res.json();
-        if (json.errors) throw new Error(`Shopify Error: ${JSON.stringify(json.errors)}`);
+        if (json.errors) {
+            const e = new Error(`Shopify Error: ${JSON.stringify(json.errors)}`);
+            const throttled = Array.isArray(json.errors) && json.errors.some(x => x?.extensions?.code === "THROTTLED");
+            e.noRetry = !throttled;
+            throw e;
+        }
         return json.data;
     } catch (err) {
-        if (retryCount < 3) {
+        if (!err.noRetry && retryCount < 3) {
             addLog(`Retrying Shopify (${retryCount + 1}/3)...`, "warning");
             await new Promise(r => setTimeout(r, 5000));
             return shopifyGraphQL(query, variables, retryCount + 1);
@@ -363,48 +368,30 @@ async function getAllShopifyVariants() {
 
 async function getCurrentPriceListPrices(variantId) {
     try {
+        const numericId = String(variantId).split("/").pop();
+        const q = `variant_id:${numericId}`;
+        const frag = `prices(first: 1, query: $q) { edges { node { price { amount } } } }`;
         const query = `
-            query($variantId: ID!) {
-                silver: priceList(id: "${SILVER_PRICE_LIST}") {
-                    priceListPrices(first: 1, variantId: $variantId) {
-                        edges {
-                            node {
-                                price { amount }
-                            }
-                        }
-                    }
-                }
-                gold: priceList(id: "${GOLD_PRICE_LIST}") {
-                    priceListPrices(first: 1, variantId: $variantId) {
-                        edges {
-                            node {
-                                price { amount }
-                            }
-                        }
-                    }
-                }
-                platinum: priceList(id: "${PLATINUM_PRICE_LIST}") {
-                    priceListPrices(first: 1, variantId: $variantId) {
-                        edges {
-                            node {
-                                price { amount }
-                            }
-                        }
-                    }
-                }
+            query($silverId: ID!, $goldId: ID!, $platinumId: ID!, $q: String!) {
+                silver: priceList(id: $silverId) { ${frag} }
+                gold: priceList(id: $goldId) { ${frag} }
+                platinum: priceList(id: $platinumId) { ${frag} }
             }
         `;
         
-        const data = await shopifyGraphQL(query, { variantId });
+        const data = await shopifyGraphQL(query, {
+            silverId: SILVER_PRICE_LIST,
+            goldId: GOLD_PRICE_LIST,
+            platinumId: PLATINUM_PRICE_LIST,
+            q
+        });
         
-        const silverPrice = data?.silver?.priceListPrices?.edges?.[0]?.node?.price?.amount || 0;
-        const goldPrice = data?.gold?.priceListPrices?.edges?.[0]?.node?.price?.amount || 0;
-        const platinumPrice = data?.platinum?.priceListPrices?.edges?.[0]?.node?.price?.amount || 0;
+        const amt = (list) => parseFloat(list?.prices?.edges?.[0]?.node?.price?.amount || 0);
         
         return {
-            silver: parseFloat(silverPrice),
-            gold: parseFloat(goldPrice),
-            platinum: parseFloat(platinumPrice)
+            silver: amt(data?.silver),
+            gold: amt(data?.gold),
+            platinum: amt(data?.platinum)
         };
     } catch (err) {
         addLog(`⚠️ Could not fetch prices for ${variantId}: ${err.message}`, "warning");
