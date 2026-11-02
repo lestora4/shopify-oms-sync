@@ -110,12 +110,17 @@ async function omsThrottle() {
     if (wait > 0) await new Promise(r => setTimeout(r, wait));
 }
 
-async function lookupSkuInOMS(sku, attempt = 0) {
+// upc (optional): Shopify barcode. Used as a fallback when the item_num lookup returns nothing,
+// e.g. OMS item_num values that contain hidden control characters (like a leading \u001f).
+// useUpc is internal: true when this call is the UPC fallback attempt.
+async function lookupSkuInOMS(sku, attempt = 0, upc = null, useUpc = false) {
     if (!sku) return null;
-    omsFailReasons.delete(sku);
+    if (!useUpc) omsFailReasons.delete(sku);
     
     try {
-        const url = `https://api.omspavo.com/product/variants?item_num=${encodeURIComponent(sku)}`;
+        const url = useUpc
+            ? `https://api.omspavo.com/product/variants?upc=${encodeURIComponent(upc)}`
+            : `https://api.omspavo.com/product/variants?item_num=${encodeURIComponent(sku)}`;
         await omsThrottle();
         const response = await fetch(url, {
             headers: { "X-Pavo-Token": OMS_API_KEY }
@@ -133,7 +138,7 @@ async function lookupSkuInOMS(sku, attempt = 0) {
                     omsPauseUntil = Math.max(omsPauseUntil, Date.now() + waitMs);
                 }
                 await new Promise(r => setTimeout(r, waitMs));
-                return lookupSkuInOMS(sku, attempt + 1);
+                return lookupSkuInOMS(sku, attempt + 1, upc, useUpc);
             }
             omsFailReasons.set(sku, `OMS API error HTTP ${response.status} (request failed, not a missing SKU)`);
             addLog(`⚠️ OMS API error for ${sku}: ${response.status}`, "warning");
@@ -143,7 +148,21 @@ async function lookupSkuInOMS(sku, attempt = 0) {
         const data = await response.json();
         
         if (!data.variants || data.variants.length === 0) {
-            omsFailReasons.set(sku, "Not found in OMS (no variants returned for this SKU)");
+            // Fallback: retry by UPC (Shopify barcode) if item_num lookup found nothing
+            if (!useUpc && upc) {
+                const viaUpc = await lookupSkuInOMS(sku, 0, upc, true);
+                if (viaUpc) {
+                    addLog(`🔁 ${sku} matched in OMS via UPC ${upc} (item_num lookup failed; OMS SKU: ${JSON.stringify(viaUpc.originalSku)})`, "info");
+                    return viaUpc;
+                }
+                if (!omsFailReasons.has(sku)) {
+                    omsFailReasons.set(sku, `Not found in OMS by item_num or UPC (${upc})`);
+                }
+                return null;
+            }
+            omsFailReasons.set(sku, useUpc
+                ? `Not found in OMS by item_num or UPC (${upc})`
+                : "Not found in OMS (no variants returned for this SKU)");
             return null;
         }
         
@@ -213,7 +232,7 @@ async function lookupSkuInOMS(sku, attempt = 0) {
     } catch (err) {
         if (attempt < 3) {
             await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt)));
-            return lookupSkuInOMS(sku, attempt + 1);
+            return lookupSkuInOMS(sku, attempt + 1, upc, useUpc);
         }
         omsFailReasons.set(sku, `OMS request failed: ${err.message}`);
         if (sku === "A37-5G-CH56-BLK") {
@@ -386,6 +405,7 @@ async function getAllShopifyVariants() {
                     node { 
                         id 
                         sku
+                        barcode
                         product {
                             id
                             title
@@ -407,6 +427,7 @@ async function getAllShopifyVariants() {
                 variants.push({
                     id: edge.node.id,
                     sku: edge.node.sku,
+                    upc: edge.node.barcode || null,
                     productId: edge.node.product?.id,
                     title: edge.node.product?.title || edge.node.sku
                 });
@@ -567,7 +588,7 @@ async function detectManualPriceChanges() {
             }
             
             const currentPrices = await getCurrentPriceListPrices(variant.id);
-            const omsPrices = await lookupSkuInOMS(sku);
+            const omsPrices = await lookupSkuInOMS(sku, 0, variant.upc);
             if (!omsPrices) continue;
             
             const matchesOMS = 
@@ -718,7 +739,7 @@ async function runSync(options = {}) {
             shopifyVariants,
             CONCURRENT_REQUESTS,
             async (variant) => {
-                const omsPrices = await lookupSkuInOMS(variant.sku);
+                const omsPrices = await lookupSkuInOMS(variant.sku, 0, variant.upc);
                 
                 if (omsPrices) {
                     return { ...variant, omsPrices, found: true };
@@ -943,6 +964,7 @@ async function syncSingleSku(sku, source = "webhook") {
                     edges {
                         node {
                             id
+                            barcode
                             product { title }
                         }
                     }
@@ -958,7 +980,7 @@ async function syncSingleSku(sku, source = "webhook") {
             return;
         }
         
-        const omsPrices = await lookupSkuInOMS(sku);
+        const omsPrices = await lookupSkuInOMS(sku, 0, variant.barcode || null);
         if (!omsPrices) {
             addLog(`❌ SKU ${sku} not found in OMS`, "error");
             return;
